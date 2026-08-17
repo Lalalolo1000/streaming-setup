@@ -107,3 +107,36 @@ Für Fernwartung nur des Masters siehe **README_REMOTE_ACCESS.md**.
 - `README_GITHUB_UPDATES.md` – GitHub-Workflow von zuhause
 - `README_REMOTE_ACCESS.md` – optional Tailscale
 - `README_STREAMING_SETUP.md` – UI/Projektbesonderheiten
+
+## Master is also Stream 01 (.101)
+
+`192.168.0.101` is special: it runs this controller **and** can run one of the 24 streams.
+The default config marks it with `"role": "master"`. Existing local `nodes.json` files
+are also recognized by the `.101` address, so Git never has to overwrite local config.
+
+The master intentionally stays writable. Worker Pis may remain protected by OverlayFS.
+If the master still uses OverlayFS, run once:
+
+```bash
+./prepare_master_writable.sh
+sudo reboot
+```
+
+After reboot, verify:
+
+```bash
+findmnt -n -o FSTYPE /
+```
+
+It must not print `overlay`.
+
+### Operations involving the master
+
+- Start / Stop / Check / Logs for Stream 01 run **locally**. The controller never SSHes into itself for these actions.
+- Reboot Stream 01 reboots the master locally. The reboot job is persisted; after boot the controller finishes the job and starts/checks the stream again.
+- `Alle neu starten`: all worker Pis are rebooted and allowed to come back first; the master reboots **last**.
+- `Alle herunterfahren`: all worker Pis are shut down first; the master powers off **last**.
+- `Alle aktualisieren`: worker Pis use the existing OverlayFS-safe two-reboot updater. The master is never sent through that updater. Instead its VLC + Streamlink packages are updated locally without rebooting or toggling OverlayFS.
+- A single-node OverlayFS update of the master is rejected intentionally.
+
+The controller recognizes only one master. Do not mark a second node as `role=master`.

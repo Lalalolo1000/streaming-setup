@@ -93,3 +93,19 @@ STREAM_MASTER_GIT_INTERVAL=2min ./install_service.sh
 ```
 
 Danach werden die systemd-Units neu geschrieben und aktiviert.
+
+## Master must stay writable
+
+The controller master (`192.168.0.101`) intentionally does not use root OverlayFS.
+`git_update.sh` refuses to deploy if `/` is currently `overlay`, because such a checkout would not persist reliably across reboot.
+
+One-time fix:
+
+```bash
+./prepare_master_writable.sh
+sudo reboot
+```
+
+Worker nodes remain unchanged and can continue using OverlayFS.
+
+The master stream itself runs in the separate `streaming-setup-local-stream.service` cgroup. Therefore restarting `stream-master.service` after a Git update does not stop Stream 01.

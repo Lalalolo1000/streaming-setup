@@ -26,6 +26,15 @@ if [ ! -d "$DIR/.git" ]; then
     exit 0
 fi
 
+# The controller master intentionally stays on its real writable root. A Git
+# update performed while / is OverlayFS would appear to work but disappear
+# after the next reboot, so refuse that state explicitly.
+ROOT_FSTYPE="$(findmnt -n -o FSTYPE / 2>/dev/null || echo unknown)"
+if [ "$ROOT_FSTYPE" = "overlay" ]; then
+    log "SICHERHEITSSTOPP: Der Master läuft noch mit OverlayFS. Erst ./prepare_master_writable.sh ausführen und neu starten."
+    exit 9
+fi
+
 if [ -z "$BRANCH" ]; then
     BRANCH="$(git -C "$DIR" branch --show-current 2>/dev/null || true)"
     [ -n "$BRANCH" ] || BRANCH=main
@@ -50,6 +59,9 @@ if isinstance(u, dict) and u.get('running'):
     raise SystemExit(1)
 j=read('node_jobs.json', {})
 if isinstance(j, dict) and any(isinstance(v, dict) and v.get('running') for v in j.values()):
+    raise SystemExit(1)
+f=read('fleet_job.json', {})
+if isinstance(f, dict) and f.get('running'):
     raise SystemExit(1)
 PY
     then
@@ -110,7 +122,7 @@ validate_new_code() {
     [ -f "$DIR/master.py" ] && [ -f "$DIR/update_pis.py" ] || return 1
     [ -f "$DIR/web/index.html" ] && [ -f "$DIR/web/app.js" ] && [ -f "$DIR/web/style.css" ] || return 1
     /usr/bin/python3 -m py_compile "$DIR/master.py" "$DIR/update_pis.py" || return 1
-    for f in "$DIR"/scripts/*.sh "$DIR"/run_master.sh "$DIR"/git_update.sh "$DIR"/git_update_systemd.sh; do
+    for f in "$DIR"/scripts/*.sh "$DIR"/run_master.sh "$DIR"/git_update.sh "$DIR"/git_update_systemd.sh "$DIR"/prepare_master_writable.sh "$DIR"/update_master_local.sh "$DIR"/local_stream_service.sh; do
         [ -f "$f" ] || return 1
         /bin/bash -n "$f" || return 1
     done

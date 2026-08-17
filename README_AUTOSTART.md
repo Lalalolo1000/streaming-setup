@@ -95,3 +95,10 @@ Während eines Node-Updates wird OverlayFS zeitweise deaktiviert. Deshalb:
 - bei `Sicherheitsprüfung erforderlich` zuerst die Admin-Recovery ausführen
 
 Der Git-Timer überspringt Updates automatisch, solange eine solche Wartung oder Recovery aktiv ist.
+
+## Master .101 and daily power-on
+
+The controller master is also Stream 01. It must stay writable; see `README_MASTER_NODE.md`.
+At a fresh OS boot, `stream-master.service` starts and the once-per-boot worker starts every configured stream. A Git-triggered service restart during the same OS boot does not repeat the whole startup pass.
+
+Fleet reboot/shutdown actions persist their state under `runtime/`. This is important because the controller intentionally disappears when the master reboots or powers off. The master always performs its own power action last.

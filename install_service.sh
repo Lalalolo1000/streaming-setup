@@ -7,7 +7,9 @@ RUN_HOME="$(getent passwd "$RUN_USER" | cut -d: -f6)"
 SERVICE=/etc/systemd/system/stream-master.service
 UPDATE_SERVICE=/etc/systemd/system/stream-master-git-update.service
 UPDATE_TIMER=/etc/systemd/system/stream-master-git-update.timer
+LOCAL_STREAM_SERVICE=/etc/systemd/system/streaming-setup-local-stream.service
 PORT="${STREAM_MASTER_PORT:-8080}"
+MASTER_IP="${STREAM_MASTER_MASTER_IP:-192.168.0.101}"
 GIT_INTERVAL="${STREAM_MASTER_GIT_INTERVAL:-5min}"
 GIT_BRANCH="${STREAM_MASTER_GIT_BRANCH:-}"
 CONFIG_DIR="$RUN_HOME/.config/stream-master"
@@ -50,6 +52,7 @@ WorkingDirectory=$DIR
 Environment=PYTHONUNBUFFERED=1
 Environment=STREAM_MASTER_PORT=$PORT
 Environment=STREAM_MASTER_AUTOSTART=1
+Environment=STREAM_MASTER_MASTER_IP=$MASTER_IP
 EnvironmentFile=-$GIT_ENV
 ExecStart=/bin/bash "$DIR/run_master.sh"
 Restart=on-failure
@@ -96,9 +99,36 @@ Unit=stream-master-git-update.service
 WantedBy=timers.target
 EOF_UNIT
 
+# The master is also Stream 01. Keep its stream in a separate cgroup so a Git
+# restart of stream-master.service does not kill VLC/Streamlink on the master.
+sudo tee "$LOCAL_STREAM_SERVICE" >/dev/null <<EOF_UNIT
+[Unit]
+Description=Streaming Setup local master stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$RUN_USER
+Group=$RUN_GROUP
+WorkingDirectory=$DIR
+Environment=STREAM_MASTER_MASTER_IP=$MASTER_IP
+ExecStart=/bin/bash "$DIR/local_stream_service.sh" start
+ExecStop=/bin/bash "$DIR/local_stream_service.sh" stop
+TimeoutStartSec=45
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now stream-master.service
 sudo systemctl enable --now stream-master-git-update.timer
+# The local-stream unit is intentionally not enabled on its own; the controller's
+# once-per-boot startup pass starts/restarts it using the current nodes.json URL.
 
 echo
 echo 'Streaming Setup wurde als stream-master.service installiert und gestartet.'
@@ -106,4 +136,5 @@ echo "GitHub-Prüfung: alle $GIT_INTERVAL (nur wenn dieses Verzeichnis ein Git-C
 echo 'Status: sudo systemctl status stream-master --no-pager'
 echo 'Logs:   journalctl -u stream-master -f'
 echo 'Git:    systemctl list-timers stream-master-git-update.timer'
+echo 'Master stream: systemctl status streaming-setup-local-stream --no-pager'
 echo "URL:    http://$(hostname -I 2>/dev/null | awk '{print $1}'):$PORT/"

@@ -5,7 +5,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "master"
   },
   {
     "name": "Stream 02",
@@ -13,7 +14,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 03",
@@ -21,7 +23,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 04",
@@ -29,7 +32,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 05",
@@ -37,7 +41,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 06",
@@ -45,7 +50,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 07",
@@ -53,7 +59,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 08",
@@ -61,7 +68,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 09",
@@ -69,7 +77,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 10",
@@ -77,7 +86,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 11",
@@ -85,7 +95,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 12",
@@ -93,7 +104,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 13",
@@ -101,7 +113,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 14",
@@ -109,7 +122,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 15",
@@ -117,7 +131,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 16",
@@ -125,7 +140,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 17",
@@ -133,7 +149,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 18",
@@ -141,7 +158,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 19",
@@ -149,7 +167,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 20",
@@ -157,7 +176,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 21",
@@ -165,7 +185,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 22",
@@ -173,7 +194,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 23",
@@ -181,7 +203,8 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   },
   {
     "name": "Stream 24",
@@ -189,6 +212,7 @@
     "port": 22,
     "url": "",
     "quality": "max480",
-    "connector": "HDMI-A-1"
+    "connector": "HDMI-A-1",
+    "role": "node"
   }
 ]

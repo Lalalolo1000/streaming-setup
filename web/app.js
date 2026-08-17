@@ -4,6 +4,7 @@ let nodes=[];
 let health=new Map();
 let jobs={};
 let updateState={running:false};
+let fleetState={running:false};
 let recoveryGuard=null;
 let currentView='simple';
 let checkAllPromise=null;
@@ -12,10 +13,12 @@ let autoTimer=null;
 let lastJobs={};
 const AUTO_CHECK_MS=20000;
 const CHECK_CONCURRENCY=6;
+const MASTER_IP='192.168.0.101';
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const isMaster=n=>!!n&&(isMaster(n)||String(n.target||'').endsWith(`@${MASTER_IP}`));
 
 function setNotice(text,kind='',scope='all'){
   const el=$('notice');
@@ -125,6 +128,7 @@ function stageDisplay(raw){
     'apt update':'Paketlisten werden aktualisiert',
     'updating VLC':'VLC wird aktualisiert',
     'updating Streamlink':'Streamlink wird aktualisiert',
+    'updating master locally':'Master wird lokal aktualisiert (kein Reboot)',
     'recovering after update failure':'Sichere Wiederherstellung nach Update-Fehler',
     'complete':'Abgeschlossen',
     'failed':'Fehlgeschlagen',
@@ -169,6 +173,11 @@ function humanError(raw){
     'software update is currently running':'Ein Software-Update läuft gerade.',
     'cannot change config while an update is running':'Die Konfiguration kann während eines Updates nicht geändert werden.',
     'finish reboot/shutdown operations before starting an update':'Warte, bis laufende Neustart-/Herunterfahr-Aktionen beendet sind.',
+    'finish fleet reboot/shutdown before starting an update':'Warte, bis der Gesamt-Neustart bzw. das Gesamt-Herunterfahren beendet ist.',
+    'fleet power operation is currently running':'Eine Gesamt-Neustart-/Herunterfahr-Aktion läuft gerade.',
+    'fleet power operation already in progress':'Eine Gesamt-Neustart-/Herunterfahr-Aktion läuft bereits.',
+    'finish current node operations first':'Warte, bis laufende Einzelaktionen beendet sind.',
+    'the master node stays writable and is intentionally excluded from OverlayFS node updates':'Der Master bleibt absichtlich schreibbar und wird beim OverlayFS-Node-Update übersprungen.',
     'an interrupted-update recovery guard exists; recover it before starting another update':'Ein unterbrochenes Update muss zuerst sicher wiederhergestellt werden.',
     'an update/recovery is already running':'Ein Update oder eine Wiederherstellung läuft bereits.',
     'no interrupted-update recovery guard exists':'Es gibt keinen offenen Wiederherstellungsfall.',
@@ -193,7 +202,7 @@ function humanError(raw){
 }
 
 function jobFor(i){return jobs[nodes[i]?.target]||null}
-function rowBusy(i){const j=jobFor(i);return !!(updateState.running||(j&&j.running))}
+function rowBusy(i){const j=jobFor(i);return !!(updateState.running||fleetState.running||(j&&j.running))}
 
 function render(){
   const list=$('node-list');
@@ -202,11 +211,11 @@ function render(){
     updateSummary();
     return;
   }
-  list.innerHTML=nodes.map((n,i)=>`<article class="node" id="node-${i}">
+  list.innerHTML=nodes.map((n,i)=>`<article class="node ${isMaster(n)?'master-node':''}" id="node-${i}">
     <div class="node-main">
       <div class="node-header">
         <div>
-          <div class="node-name">${esc(n.name||`Raspberry Pi ${i+1}`)}</div>
+          <div class="node-name">${esc(n.name||`Raspberry Pi ${i+1}`)}${isMaster(n)?' <span class="master-badge admin-only">MASTER</span>':''}</div>
           <div class="node-target-simple admin-only mono">${esc(n.target||'—')}:${esc(n.port??22)}</div>
         </div>
         <div class="status">
@@ -249,7 +258,7 @@ function render(){
         <button class="button" data-node-button type="button" onclick="showLogs(${i})">Protokoll</button>
         <button class="button" data-node-button type="button" onclick="silentCheck(${i},true)">Jetzt prüfen</button>
         <button class="button" data-node-button type="button" onclick="openEdit(${i},true)">Vollständige Konfiguration</button>
-        <button class="button" data-node-button type="button" onclick="startUpdate(${i})">VLC + Streamlink aktualisieren</button>
+        ${isMaster(n)?'<button class="button" type="button" disabled title="Der Master bleibt schreibbar. Bei „Alle aktualisieren“ werden VLC + Streamlink lokal ohne Reboot aktualisiert.">Master: lokal bei „Alle aktualisieren“</button>':`<button class="button" data-node-button type="button" onclick="startUpdate(${i})">VLC + Streamlink aktualisieren</button>`}
       </div>
     </div>
   </article>`).join('');
@@ -295,7 +304,17 @@ function applyHealth(i,d){
     detail.textContent=text||'—';detail.title=detail.textContent;
     const statusBox=detail.closest('.status');if(statusBox)statusBox.title=detail.textContent;
   }
-  const lock=$(`lock-${i}`);if(lock){lock.textContent=d.LOCKED==='yes'?'GESCHÜTZT':d.LOCKED==='no'?'SCHREIBBAR':'Unbekannt';lock.className=`fact-value ${d.LOCKED==='yes'?'good-text':d.LOCKED==='no'?'bad-text':''}`}
+  const lock=$(`lock-${i}`);if(lock){
+    if(isMaster(nodes[i])){
+      const overlay=String(d.ROOT_FSTYPE||'').toLowerCase()==='overlay'||d.OVERLAY_ACTIVE==='yes';
+      lock.textContent=overlay?'MASTER · OVERLAYFS AKTIV':'MASTER · SCHREIBBAR';
+      lock.className=`fact-value ${overlay?'bad-text':'good-text'}`;
+      lock.title=overlay?'Der Master soll für Git und lokale Konfiguration dauerhaft schreibbar sein. ./prepare_master_writable.sh ausführen.':'Erwarteter Zustand: der Master bleibt dauerhaft schreibbar.';
+    }else{
+      lock.textContent=d.LOCKED==='yes'?'GESCHÜTZT':d.LOCKED==='no'?'SCHREIBBAR':'Unbekannt';
+      lock.className=`fact-value ${d.LOCKED==='yes'?'good-text':d.LOCKED==='no'?'bad-text':''}`;
+    }
+  }
   const q=$(`quality-${i}`);if(q){const selected=d.SELECTED_STREAM&&d.SELECTED_STREAM!=='unknown'?d.SELECTED_STREAM:'—';q.textContent=`${d.STREAM_QUALITY_POLICY||nodes[i]?.quality||'max480'} · ${selected}`}
   const v=$(`versions-${i}`);if(v){let vlc=String(d.VLC_VERSION||'unknown');const m=vlc.match(/VLC (?:media player|version)\s+([^\s]+)/i);if(m)vlc=m[1];let sl=String(d.STREAMLINK_VERSION||'unknown').replace(/^streamlink\s+/i,'');v.textContent=`SL ${sl} · VLC ${vlc}`}
   const u=$(`updated-${i}`);if(u){const x=d.LAST_UPDATE_UTC;u.textContent=(!x||x==='unknown')?'Unbekannt':formatDate(x)}
@@ -348,6 +367,7 @@ function updateSummary(){
     if(h==='live')live++;else if(['starting','connecting','retrying','cooldown','running'].includes(h))waiting++;else if(h==='stopped')stopped++;else if(h==='unknown')unknown++;else failed++;
   });
   const parts=[`${reachableRunning}/${nodes.length} aktiv`];
+  if(fleetState.running)parts.unshift(fleetState.kind==='reboot'?'Gesamt-Neustart läuft':'Gesamt-Herunterfahren läuft');
   if(waiting)parts.push(`${waiting} warten`);if(failed)parts.push(`${failed} Probleme`);if(stopped)parts.push(`${stopped} gestoppt`);if(unknown)parts.push(`${unknown} ungeprüft`);
   $('summary').textContent=parts.join(' · ');
   updateFavicon(reachableRunning);
@@ -368,23 +388,37 @@ async function runOne(i,action){
 
 async function powerAction(i,kind){
   const node=nodes[i];
-  const text=kind==='reboot'?`${node.name} neu starten?\n\nDer Server wartet, bis der Raspberry Pi wieder erreichbar ist, und startet danach automatisch den konfigurierten Stream.`:`${node.name} herunterfahren?\n\nDer Raspberry Pi bleibt ausgeschaltet, bis die Stromversorgung wiederhergestellt wird.`;
+  const master=isMaster(node);
+  const text=kind==='reboot'
+    ?`${node.name} neu starten?\n\n${master?'Das ist der Master. Die Weboberfläche ist während des Neustarts kurz nicht erreichbar; der Auftrag wird nach dem Boot fortgesetzt.':'Der Server wartet, bis der Raspberry Pi wieder erreichbar ist, und startet danach automatisch den konfigurierten Stream.'}`
+    :`${node.name} herunterfahren?\n\n${master?'Das ist der Master. Die Weboberfläche wird danach nicht mehr erreichbar sein, bis die Stromversorgung wiederhergestellt wird.':'Der Raspberry Pi bleibt ausgeschaltet, bis die Stromversorgung wiederhergestellt wird.'}`;
   if(!confirm(text))return;
   try{const d=await nodeCall(i,kind);if(!d.ok)throw new Error(humanError(d.error)||'Aktion fehlgeschlagen');jobs[node.target]=d.job;applyJobs();setNotice(`${node.name}: ${kind==='reboot'?'Neustart':'Herunterfahren'} gestartet`,'warn')}catch(e){setNotice(`${node.name}: ${e.message}`,'bad')}
 }
 
 async function runFleet(action){
   if(!nodes.length)return;
-  if(action==='reboot'&&!confirm(`Alle ${nodes.length} Raspberry Pis neu starten?\n\nNach dem Neustart wird auf jedem Raspberry Pi der konfigurierte Stream wieder gestartet.`))return;
-  if(action==='shutdown'&&!confirm(`Alle ${nodes.length} Raspberry Pis herunterfahren?\n\nSie bleiben ausgeschaltet, bis die Stromversorgung wiederhergestellt wird.`))return;
+  if(action==='reboot'&&!confirm(`Alle ${nodes.length} Raspberry Pis neu starten?\n\nZuerst werden die ${nodes.filter(n=>!isMaster(n)).length} Worker neu gestartet und wieder hochgefahren. Der Master wird ganz zuletzt neu gestartet.`))return;
+  if(action==='shutdown'&&!confirm(`Alle ${nodes.length} Raspberry Pis herunterfahren?\n\nZuerst werden die Worker sauber heruntergefahren. Der Master fährt ganz zuletzt herunter.`))return;
   if(action==='kill'&&!confirm(`Streams auf allen ${nodes.length} Raspberry Pis stoppen?`))return;
+
+  if(action==='reboot'||action==='shutdown'){
+    try{
+      const r=await fetch(`/api/fleet/${action}`,{method:'POST'});
+      const d=await r.json();
+      if(!r.ok)throw new Error(humanError(d.error)||'Gesamtaktion konnte nicht gestartet werden');
+      fleetState=d.fleet||{running:true,kind:action};
+      setNotice(action==='reboot'?'Gesamt-Neustart gestartet: Worker zuerst, Master zuletzt.':'Gesamt-Herunterfahren gestartet: Worker zuerst, Master zuletzt.','warn');
+      applyJobs();updateSummary();
+    }catch(e){setNotice(`Gesamtaktion: ${e.message}`,'bad')}
+    return;
+  }
+
   setNotice('Aktion für alle Raspberry Pis wird gestartet …');
   let failed=0,done=0;
   await poolIndices(nodes.map((_,i)=>i),4,async i=>{
-    try{
-      if(action==='reboot'||action==='shutdown'){const d=await nodeCall(i,action);jobs[nodes[i].target]=d.job}
-      else{const d=await nodeCall(i,action);if(!d.ok)failed++}
-    }catch{failed++}
+    try{const d=await nodeCall(i,action);if(!d.ok)failed++}
+    catch{failed++}
     finally{done++;setNotice(`Fortschritt: ${done}/${nodes.length}${failed?` · ${failed} fehlgeschlagen`:''}`,failed?'warn':'')}
   });
   applyJobs();
@@ -402,7 +436,7 @@ function applyJobs(){
       row.classList.remove('state-live','state-warning','state-failed','state-stopped','state-unknown');row.classList.add('state-warning');
       if(dot)dot.className=`dot ${cls}`;if(status)status.textContent=label;if(detail)detail.textContent=stageDisplay(job.message||job.stage||'');
     }else{
-      buttons.forEach(b=>b.disabled=!!updateState.running);
+      buttons.forEach(b=>b.disabled=!!updateState.running||!!fleetState.running);
       if(health.has(i))applyHealth(i,health.get(i));
     }
   });
@@ -412,7 +446,7 @@ function applyJobs(){
 async function refreshState(){
   try{
     const r=await fetch('/api/state');const d=await r.json();if(!r.ok)throw new Error(humanError(d.error)||'Serverstatus konnte nicht geladen werden');
-    const previous=jobs;jobs=d.jobs||{};updateState=d.update||{running:false};recoveryGuard=d.recovery_guard||null;
+    const previous=jobs;jobs=d.jobs||{};updateState=d.update||{running:false};fleetState=d.fleet||{running:false};recoveryGuard=d.recovery_guard||null;
     applyUpdate();applyRecovery();applyJobs();
     nodes.forEach((n,i)=>{const before=previous[n.target],after=jobs[n.target];if(before&&before.running&&after&&!after.running)setTimeout(()=>silentCheck(i,false),500)});
     lastJobs=previous;
@@ -420,7 +454,7 @@ async function refreshState(){
 }
 
 function applyUpdate(){
-  const strip=$('update-strip');const running=!!updateState.running;document.querySelectorAll('button[data-node-button], [data-fleet-action], .admin-panel button').forEach(b=>b.disabled=running);
+  const strip=$('update-strip');const running=!!updateState.running;document.querySelectorAll('button[data-node-button], [data-fleet-action], .admin-panel button').forEach(b=>b.disabled=running||!!fleetState.running);
   const has=running||updateState.started_at;
   const oldSuccess=!running&&updateState.returncode===0&&updateState.finished_at&&((Date.now()/1000)-updateState.finished_at>10);
   strip.hidden=!has||oldSuccess;
@@ -439,8 +473,13 @@ function applyRecovery(){
 }
 
 async function startUpdate(index){
-  const label=index==null?`alle ${nodes.length} Raspberry Pis nacheinander`:nodes[index].name;
-  if(!confirm(`VLC + Streamlink auf ${label} aktualisieren?\n\nWährend des Updates wird OverlayFS vorübergehend deaktiviert und der Raspberry Pi zweimal neu gestartet. Währenddessen nicht ausschalten.`))return;
+  if(index!=null&&isMaster(nodes[index])){setNotice('Der Master bleibt dauerhaft schreibbar. VLC + Streamlink werden auf ihm über „Alle aktualisieren“ lokal ohne Reboot aktualisiert.','warn','admin');return}
+  const workers=nodes.filter(n=>!isMaster(n));
+  const label=index==null?`alle ${workers.length} Worker nacheinander + Master lokal ohne Reboot`:nodes[index].name;
+  const updateInfo=index==null
+    ?`Die Worker werden nacheinander mit dem OverlayFS-sicheren Zwei-Neustart-Verfahren aktualisiert. Der Master bleibt online und aktualisiert VLC + Streamlink lokal ohne OverlayFS-Umschaltung oder Neustart.`
+    :`Auf diesem Worker wird OverlayFS vorübergehend deaktiviert und der Raspberry Pi zweimal neu gestartet.`;
+  if(!confirm(`VLC + Streamlink auf ${label} aktualisieren?\n\n${updateInfo}\n\nWährend der Wartung nicht ausschalten.`))return;
   try{
     const body=index==null?{all:true}:{index};const r=await fetch('/api/update/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(humanError(d.error)||'Update konnte nicht gestartet werden');updateState=d;applyUpdate();setNotice('Update gestartet','warn','admin')
   }catch(e){setNotice(`Update: ${e.message}`,'bad','admin')}
@@ -467,7 +506,7 @@ function openEdit(i,admin){
 
 async function saveEdit(){
   const index=$('edit-index').value===''?null:Number($('edit-index').value);const old=index==null?null:nodes[index];const admin=$('edit-dialog').dataset.admin==='1';
-  const node={name:$('edit-name').value.trim(),url:$('edit-url').value.trim(),target:admin?$('edit-target').value.trim():old?.target,port:admin?Number($('edit-port').value):old?.port,quality:admin?$('edit-quality').value.trim()||'max480':old?.quality,connector:admin?$('edit-connector').value.trim()||'HDMI-A-1':old?.connector};
+  const node={name:$('edit-name').value.trim(),url:$('edit-url').value.trim(),target:admin?$('edit-target').value.trim():old?.target,port:admin?Number($('edit-port').value):old?.port,quality:admin?$('edit-quality').value.trim()||'max480':old?.quality,connector:admin?$('edit-connector').value.trim()||'HDMI-A-1':old?.connector,role:old?.role||(isMaster(old)?'master':'node')};
   if(index==null&&!admin){return}
   $('save-button').disabled=true;$('edit-error').hidden=true;
   try{

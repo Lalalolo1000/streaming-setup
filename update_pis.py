@@ -46,6 +46,7 @@ NODES_FILE = APP_DIR / "nodes.json"
 NODES_DEFAULT_FILE = APP_DIR / "nodes.default.json"
 SCRIPTS_DIR = APP_DIR / "scripts"
 SSH_PASSWORD_FILE = Path.home() / ".config" / "stream-master" / "ssh-password"
+MASTER_IP = os.environ.get("STREAM_MASTER_MASTER_IP", "192.168.0.101")
 RUNTIME_DIR = APP_DIR / "runtime"
 GUARD_FILE = RUNTIME_DIR / "update_guard.json"
 
@@ -116,6 +117,16 @@ def read_nodes() -> list[dict]:
 
 def node_name(node: dict) -> str:
     return str(node.get("name") or node.get("target") or "node")
+
+
+def is_master_node(node: dict) -> bool:
+    if str(node.get("role", "node")).lower() == "master":
+        return True
+    try:
+        host = str(node.get("target", "")).rsplit("@", 1)[1]
+    except IndexError:
+        return False
+    return host == MASTER_IP
 
 
 def ssh_base(node: dict) -> list[str]:
@@ -743,7 +754,10 @@ def recover_guard() -> None:
 
 def select_nodes(nodes: list[dict], selectors: list[str], all_nodes: bool) -> list[dict]:
     if all_nodes:
-        return nodes
+        selected = [n for n in nodes if not is_master_node(n)]
+        if not selected:
+            raise UpdateError("No worker nodes are configured. The master is intentionally excluded.")
+        return selected
 
     if not selectors:
         raise UpdateError("Choose --all or at least one --node NAME_OR_TARGET")
@@ -759,6 +773,11 @@ def select_nodes(nodes: list[dict], selectors: list[str], all_nodes: bool) -> li
         if not matches:
             raise UpdateError(f"No node matches {selector!r}")
         for node in matches:
+            if is_master_node(node):
+                raise UpdateError(
+                    f"{node_name(node)} is the controller master. It stays writable and is not updated "
+                    "through the OverlayFS node updater."
+                )
             if node not in selected:
                 selected.append(node)
     return selected
@@ -766,10 +785,10 @@ def select_nodes(nodes: list[dict], selectors: list[str], all_nodes: bool) -> li
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Update only VLC + Streamlink on OverlayFS-protected Raspberry Pis."
+        description="Update VLC + Streamlink on OverlayFS-protected worker Raspberry Pis (master excluded)."
     )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--all", action="store_true", help="update every node sequentially")
+    group.add_argument("--all", action="store_true", help="update every worker node sequentially; master is skipped")
     group.add_argument("--recover-guard", action="store_true", help="recover the node recorded in runtime/update_guard.json")
     group.add_argument(
         "--node",
@@ -808,9 +827,9 @@ def main() -> int:
     print(f"Nodes file: {NODES_FILE}")
     print(f"Selected: {', '.join(node_name(n) for n in selected)}")
     if SSH_PASSWORD_FILE.is_file():
-        print(f"SSH auth: key first, password fallback from {SSH_PASSWORD_FILE}")
+        print(f"SSH auth: password-only from {SSH_PASSWORD_FILE}; host-key checks disabled")
     else:
-        print("SSH auth: key only (no password fallback file found)")
+        print("SSH auth: required password file is missing")
     print("Update scope: VLC + Streamlink ONLY. No apt full-upgrade. bootro is untouched.")
     print("Multiple nodes are updated SEQUENTIALLY.")
 

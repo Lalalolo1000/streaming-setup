@@ -40,3 +40,9 @@ Titel und Favicon zeigen das Verhältnis der erreichbaren Pis mit laufendem Stre
 ```
 
 Der Projektname selbst bleibt **Streaming Setup**.
+
+## Master node behavior
+
+In Admin, Stream 01 / `.101` is marked **MASTER**. Its filesystem status is considered healthy when it is writable. The per-node OverlayFS update button is disabled for the master. `Alle aktualisieren` updates the 23 workers with their normal OverlayFS workflow and updates VLC + Streamlink on the master locally without rebooting it.
+
+Fleet reboot/shutdown always performs the master last so the controller remains available while worker operations are being completed.

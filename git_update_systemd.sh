@@ -43,6 +43,8 @@ u=read('update_ui_state.json', {})
 if isinstance(u,dict) and u.get('running'): raise SystemExit(1)
 j=read('node_jobs.json', {})
 if isinstance(j,dict) and any(isinstance(v,dict) and v.get('running') for v in j.values()): raise SystemExit(1)
+f=read('fleet_job.json', {})
+if isinstance(f,dict) and f.get('running'): raise SystemExit(1)
 PY
     then
         echo '[git-update] New code is ready, but node maintenance is active; master restart deferred.'
