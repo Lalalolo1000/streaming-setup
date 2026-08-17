@@ -109,3 +109,15 @@ sudo reboot
 Worker nodes remain unchanged and can continue using OverlayFS.
 
 The master stream itself runs in the separate `streaming-setup-local-stream.service` cgroup. Therefore restarting `stream-master.service` after a Git update does not stop Stream 01.
+
+## Mandatory preflight at every controller start
+
+Before `master.py` starts, `run_master.sh` performs a blocking Git preflight. Defaults:
+
+```text
+attempts: 3
+fetch timeout per attempt: 15 s
+retry delay: 5 s
+```
+
+A reachable newer fast-forward commit is installed and validated before the controller starts. If GitHub cannot be reached after the bounded attempts, the last known-good local code is started. This makes the **check mandatory**, while keeping Internet/GitHub availability non-mandatory for operation.

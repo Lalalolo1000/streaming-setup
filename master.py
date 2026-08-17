@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import json
+import math
 import mimetypes
 import queue
 import re
@@ -51,11 +52,14 @@ UPDATE_RECOVERY_GRACE = 720
 STARTUP_AUTOSTART_TIMEOUT = int(os.environ.get("STREAM_MASTER_AUTOSTART_TIMEOUT", "900"))
 STARTUP_AUTOSTART_RETRY = int(os.environ.get("STREAM_MASTER_AUTOSTART_RETRY", "30"))
 STARTUP_AUTOSTART_STAGGER = float(os.environ.get("STREAM_MASTER_AUTOSTART_STAGGER", "5"))
+# Give all Pis time to finish a real OS boot before the first Start request.
+# The web UI itself is already available during this settle period.
+STARTUP_AUTOSTART_INITIAL_DELAY = float(os.environ.get("STREAM_MASTER_AUTOSTART_INITIAL_DELAY", "60"))
 RECOVERY_MONITOR_INTERVAL = float(os.environ.get("STREAM_MASTER_RECOVERY_INTERVAL", "30"))
 RECOVERY_MONITOR_INITIAL_DELAY = float(os.environ.get("STREAM_MASTER_RECOVERY_INITIAL_DELAY", "30"))
 RECOVERY_BOOT_SETTLE = float(os.environ.get("STREAM_MASTER_RECOVERY_BOOT_SETTLE", "15"))
 RECOVERY_TCP_TIMEOUT = float(os.environ.get("STREAM_MASTER_RECOVERY_TCP_TIMEOUT", "1.0"))
-RECOVERY_SAFETY_AUDIT_INTERVAL = float(os.environ.get("STREAM_MASTER_RECOVERY_AUDIT_INTERVAL", "900"))
+RECOVERY_SAFETY_AUDIT_INTERVAL = float(os.environ.get("STREAM_MASTER_RECOVERY_AUDIT_INTERVAL", "300"))
 
 SCRIPT_ACTIONS = {"start", "check", "logs", "kill", "reboot", "shutdown"}
 NORMAL_ACTIONS = {"start", "check", "logs", "kill"}
@@ -1273,12 +1277,25 @@ def powerloss_recovery_monitor() -> None:
 
     # Baseline existing nodes without triggering recovery. Normal server-start
     # autostart is responsible for the initial boot of the installation.
-    for node in read_nodes():
-        if is_master_node(node):
-            continue
+    # Seed audit timestamps across one full interval so the first authenticated
+    # audit sweep is staggered instead of all workers becoming due at once.
+    baseline_nodes = [n for n in read_nodes() if not is_master_node(n)]
+    baseline_now = now()
+    baseline_count = max(1, len(baseline_nodes))
+    for index, node in enumerate(baseline_nodes):
         target = node_key(node)
         up = tcp_up(node, timeout=RECOVERY_TCP_TIMEOUT)
-        _recovery_set(target, last_up=up, seen_down=False, pending=False, recovering=False, stage="online" if up else "offline baseline", last_audit_at=now(), updated_at=now())
+        stagger_age = RECOVERY_SAFETY_AUDIT_INTERVAL * ((index + 1) / baseline_count)
+        _recovery_set(
+            target,
+            last_up=up,
+            seen_down=False,
+            pending=False,
+            recovering=False,
+            stage="online" if up else "offline baseline",
+            last_audit_at=baseline_now - stagger_age,
+            updated_at=baseline_now,
+        )
 
     print(
         f"Power-loss recovery monitor active: TCP/{int(RECOVERY_MONITOR_INTERVAL)}s, "
@@ -1330,13 +1347,14 @@ def powerloss_recovery_monitor() -> None:
                         _recovery_set(target, pending=False, seen_down=False, recovering=False, stage="intentionally stopped", updated_at=now())
 
                 # Safety net for the rare case where a very fast reboot happens
-                # entirely between two 30-second TCP probes. Audit at most ONE
-                # worker per monitor cycle, and each worker no more often than
-                # every 15 minutes by default. This is roughly two authenticated
-                # SSH checks per minute across the whole 23-worker installation.
+                # entirely between two 30-second TCP probes. Every worker whose
+                # desired state is running receives an authenticated supervisor
+                # audit about once per RECOVERY_SAFETY_AUDIT_INTERVAL (5 minutes
+                # by default). Audits are spread across monitor cycles rather than
+                # opening SSH sessions to all workers at once.
                 audit_now = now()
-                audit_candidate = None
-                oldest = audit_now
+                due_audits: list[tuple[float, str]] = []
+                eligible_count = 0
                 with UPDATE_LOCK:
                     updating = bool(UPDATE_STATE.get("running"))
                 if not updating:
@@ -1345,26 +1363,51 @@ def powerloss_recovery_monitor() -> None:
                         with RECOVERY_LOCK:
                             st = dict(RECOVERY_NODES.get(target) or {})
                         last_audit = float(st.get("last_audit_at") or 0.0)
-                        if (
+                        eligible = (
                             st.get("last_up") is True
                             and not st.get("pending")
                             and not st.get("recovering")
                             and desired_state(node) == "running"
-                            and str(node.get("url", "")).strip()
+                            and bool(str(node.get("url", "")).strip())
                             and not active_node_job_for(target)
-                            and audit_now - last_audit >= RECOVERY_SAFETY_AUDIT_INTERVAL
-                            and last_audit < oldest
-                        ):
-                            oldest = last_audit
-                            audit_candidate = target
-                if audit_candidate:
-                    _recovery_set(audit_candidate, recovering=True, pending=True, stage="safety audit queued", updated_at=now())
-                    threading.Thread(
-                        target=_powerloss_recovery_worker,
-                        args=(audit_candidate, False),
-                        daemon=True,
-                        name=f"powerloss-audit-{audit_candidate}",
-                    ).start()
+                        )
+                        if not eligible:
+                            continue
+                        eligible_count += 1
+                        if audit_now - last_audit >= RECOVERY_SAFETY_AUDIT_INTERVAL:
+                            due_audits.append((last_audit, target))
+
+                if due_audits:
+                    # Capacity required to audit every eligible worker within the
+                    # requested interval while retaining the cheap 30-second TCP
+                    # monitor. With 23 workers / 5 minutes this is 3 audits per
+                    # cycle, i.e. roughly one SSH check every 10 seconds fleet-wide.
+                    interval = max(1.0, RECOVERY_SAFETY_AUDIT_INTERVAL)
+                    slots = max(1, math.ceil(eligible_count * RECOVERY_MONITOR_INTERVAL / interval))
+                    selected = sorted(due_audits)[:slots]
+                    spacing = RECOVERY_MONITOR_INTERVAL / max(1, len(selected))
+                    for audit_index, (_last_audit, audit_target) in enumerate(selected):
+                        _recovery_set(
+                            audit_target,
+                            recovering=True,
+                            pending=True,
+                            stage="safety audit queued",
+                            # Reserve this audit slot immediately so a slow SSH
+                            # handshake cannot cause the same node to be queued twice.
+                            last_audit_at=audit_now,
+                            updated_at=audit_now,
+                        )
+
+                        def run_staggered_audit(target=audit_target, delay=audit_index * spacing):
+                            if delay > 0:
+                                time.sleep(delay)
+                            _powerloss_recovery_worker(target, False)
+
+                        threading.Thread(
+                            target=run_staggered_audit,
+                            daemon=True,
+                            name=f"powerloss-audit-{audit_target}",
+                        ).start()
         except Exception as exc:
             print(f"Power-loss monitor error: {exc}", flush=True)
 
@@ -1448,19 +1491,31 @@ def startup_autostart_on_server_start() -> None:
     _write_startup_state(
         running=True,
         mode="every_server_start_staggered",
+        stage="waiting_for_nodes",
         started_at=now(),
         finished_at=None,
         configured=len(configured),
         total=len(nodes),
+        initial_delay_seconds=STARTUP_AUTOSTART_INITIAL_DELAY,
         stagger_seconds=STARTUP_AUTOSTART_STAGGER,
         results=[],
     )
     print(
+        f"Server startup: controller is ready; waiting {STARTUP_AUTOSTART_INITIAL_DELAY:g}s "
+        f"before the first stream Start so the Pis can finish booting."
+    )
+    if STARTUP_AUTOSTART_INITIAL_DELAY > 0:
+        time.sleep(STARTUP_AUTOSTART_INITIAL_DELAY)
+
+    _write_startup_state(stage="starting_streams")
+    print(
         f"Server startup: restarting {len(configured)}/{len(nodes)} configured streams "
         f"sequentially with {STARTUP_AUTOSTART_STAGGER:g}s spacing; "
-        f"waiting up to {STARTUP_AUTOSTART_TIMEOUT}s for Pis."
+        f"waiting up to {STARTUP_AUTOSTART_TIMEOUT}s for late Pis after the settle delay."
     )
 
+    # The initial boot-settle delay is intentionally outside the retry timeout.
+    # Once starts begin, late/unreachable Pis still receive the full retry window.
     deadline = now() + STARTUP_AUTOSTART_TIMEOUT
     results_by_target: dict[str, dict] = {}
     pending: list[tuple[dict, int]] = []

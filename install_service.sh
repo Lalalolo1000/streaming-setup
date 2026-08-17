@@ -12,6 +12,10 @@ PORT="${STREAM_MASTER_PORT:-8080}"
 MASTER_IP="${STREAM_MASTER_MASTER_IP:-192.168.0.101}"
 GIT_INTERVAL="${STREAM_MASTER_GIT_INTERVAL:-5min}"
 GIT_BRANCH="${STREAM_MASTER_GIT_BRANCH:-}"
+AUTOSTART_INITIAL_DELAY="${STREAM_MASTER_AUTOSTART_INITIAL_DELAY:-60}"
+GIT_BOOT_ATTEMPTS="${STREAM_MASTER_GIT_BOOT_ATTEMPTS:-3}"
+GIT_BOOT_RETRY_DELAY="${STREAM_MASTER_GIT_BOOT_RETRY_DELAY:-5}"
+GIT_BOOT_FETCH_TIMEOUT="${STREAM_MASTER_GIT_BOOT_FETCH_TIMEOUT:-15}"
 CONFIG_DIR="$RUN_HOME/.config/stream-master"
 GIT_ENV="$CONFIG_DIR/github.env"
 
@@ -35,6 +39,9 @@ STREAM_MASTER_GIT_REMOTE=origin
 STREAM_MASTER_GIT_BRANCH=$GIT_BRANCH
 STREAM_MASTER_GIT_FETCH_TIMEOUT=30
 STREAM_MASTER_GIT_BOOT_UPDATE=1
+STREAM_MASTER_GIT_BOOT_ATTEMPTS=$GIT_BOOT_ATTEMPTS
+STREAM_MASTER_GIT_BOOT_RETRY_DELAY=$GIT_BOOT_RETRY_DELAY
+STREAM_MASTER_GIT_BOOT_FETCH_TIMEOUT=$GIT_BOOT_FETCH_TIMEOUT
 EOF_ENV
 chmod 600 "$GIT_ENV"
 
@@ -52,6 +59,7 @@ WorkingDirectory=$DIR
 Environment=PYTHONUNBUFFERED=1
 Environment=STREAM_MASTER_PORT=$PORT
 Environment=STREAM_MASTER_AUTOSTART=1
+Environment=STREAM_MASTER_AUTOSTART_INITIAL_DELAY=$AUTOSTART_INITIAL_DELAY
 Environment=STREAM_MASTER_MASTER_IP=$MASTER_IP
 EnvironmentFile=-$GIT_ENV
 ExecStart=/bin/bash "$DIR/run_master.sh"
@@ -132,7 +140,8 @@ sudo systemctl enable --now stream-master-git-update.timer
 
 echo
 echo 'Streaming Setup wurde als stream-master.service installiert und gestartet.'
-echo "GitHub-Prüfung: alle $GIT_INTERVAL (nur wenn dieses Verzeichnis ein Git-Checkout ist)."
+echo "GitHub-Prüfung: zwingender Preflight bei jedem Serverstart + danach alle $GIT_INTERVAL."
+echo "Stream-Start nach Serverstart: ${AUTOSTART_INITIAL_DELAY}s Ruhezeit, danach gestaffelt."
 echo 'Status: sudo systemctl status stream-master --no-pager'
 echo 'Logs:   journalctl -u stream-master -f'
 echo 'Git:    systemctl list-timers stream-master-git-update.timer'

@@ -10,13 +10,40 @@ if [ ! -s "$PASSFILE" ]; then
 fi
 cd "$DIR"
 
-# Pull code before Python starts. Failure is deliberately non-fatal: if GitHub or
-# the internet is unavailable, the last known-good local code still starts.
+# Mandatory boot/service-start Git preflight.
+#
+# The controller does not start until this check has completed. If GitHub is
+# reachable, the checkout is fast-forwarded and validated before Python loads.
+# Network/GitHub failure is deliberately not fatal: after a small number of
+# bounded attempts we start the last known-good local checkout instead of
+# turning an Internet outage into a dead installation.
 if [ -d "$DIR/.git" ] && [ "${STREAM_MASTER_GIT_BOOT_UPDATE:-1}" = 1 ]; then
-    echo "[boot] Prüfe GitHub auf neuen Streaming Setup-Code …"
-    if ! /bin/bash "$DIR/git_update.sh" --boot; then
-        echo "[boot] Git-Update fehlgeschlagen; starte vorhandenen Stand." >&2
+    BOOT_ATTEMPTS="${STREAM_MASTER_GIT_BOOT_ATTEMPTS:-3}"
+    BOOT_RETRY_DELAY="${STREAM_MASTER_GIT_BOOT_RETRY_DELAY:-5}"
+    BOOT_FETCH_TIMEOUT="${STREAM_MASTER_GIT_BOOT_FETCH_TIMEOUT:-15}"
+    case "$BOOT_ATTEMPTS" in ''|*[!0-9]*) BOOT_ATTEMPTS=3 ;; esac
+    [ "$BOOT_ATTEMPTS" -ge 1 ] || BOOT_ATTEMPTS=1
+
+    echo "[boot] Mandatory GitHub preflight before Streaming Setup starts."
+    GIT_OK=0
+    attempt=1
+    while [ "$attempt" -le "$BOOT_ATTEMPTS" ]; do
+        echo "[boot] GitHub check $attempt/$BOOT_ATTEMPTS …"
+        if STREAM_MASTER_GIT_FETCH_TIMEOUT="$BOOT_FETCH_TIMEOUT" /bin/bash "$DIR/git_update.sh" --boot; then
+            GIT_OK=1
+            break
+        fi
+        if [ "$attempt" -lt "$BOOT_ATTEMPTS" ]; then
+            echo "[boot] Git check failed; retrying in ${BOOT_RETRY_DELAY}s …" >&2
+            sleep "$BOOT_RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [ "$GIT_OK" -ne 1 ]; then
+        echo "[boot] GitHub preflight could not complete; starting the last known-good local code." >&2
     fi
+else
+    echo "[boot] No Git checkout (or boot Git disabled); starting local code."
 fi
 
 # If a periodic Git update requested this service restart, reaching this point

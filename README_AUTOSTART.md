@@ -110,7 +110,7 @@ The master has a low-load recovery monitor for `.102`–`.124`.
 - Every **30 seconds** it only tests whether TCP port 22 is reachable. This is not an authenticated SSH login and does not execute anything on the Pi.
 - The monitor starts after a **30 second initial delay**, because the normal staggered startup pass already owns the first boot period.
 - Only after a worker was actually observed offline and then reachable again does the master wait **15 seconds**, run one `check.sh` over SSH, and inspect the supervisor.
-- As a safety net for an unusually fast reboot that falls completely between two TCP probes, each worker also gets **one SSH supervisor audit about every 15 minutes**. Audits are staggered: at most one worker is audited per 30-second monitor cycle.
+- As a safety net for an unusually fast reboot that falls completely between two TCP probes, each worker also gets **one SSH supervisor audit about every 5 minutes**. Audits are staggered across the five-minute window instead of being fired at all workers together. With all 23 workers running this averages about one authenticated SSH audit every 13 seconds across the whole fleet; the 30-second TCP liveness polling remains unchanged.
 - If `STATUS=running`, nothing is restarted — even when Streamlink itself is currently retrying.
 - If the `/tmp` supervisor is gone and the desired state is `running`, the master sends the current `start.sh`, URL and optional YouTube cookie again.
 - If the stream was intentionally stopped, a later Pi reboot leaves it stopped.
@@ -125,6 +125,22 @@ Optional environment overrides:
 STREAM_MASTER_RECOVERY_INTERVAL=30
 STREAM_MASTER_RECOVERY_INITIAL_DELAY=30
 STREAM_MASTER_RECOVERY_BOOT_SETTLE=15
-STREAM_MASTER_RECOVERY_AUDIT_INTERVAL=900
+STREAM_MASTER_RECOVERY_AUDIT_INTERVAL=300
 STREAM_MASTER_POWERLOSS_RECOVERY=1
 ```
+
+## Boot settle delay before Start All
+
+The controller web UI starts immediately, but the automatic stream-start pass now waits **60 seconds by default** before sending the first Start request. After that, the existing 5-second staggering remains in place. This gives worker Pis time to finish booting, initialize networking/DRM and become stable before Streamlink/VLC are launched.
+
+Override when installing the service, for example:
+
+```bash
+STREAM_MASTER_AUTOSTART_INITIAL_DELAY=90 ./install_service.sh
+```
+
+The initial settle delay does **not** consume the 15-minute retry window for late/offline Pis.
+
+## Mandatory Git preflight on service start
+
+Every `stream-master.service` start performs a blocking GitHub check **before** `master.py` is loaded. The default is three attempts with a 15-second fetch timeout and 5 seconds between attempts. If a newer fast-forward commit exists it is pulled and validated first. If GitHub remains unavailable, the service deliberately starts the last known-good local checkout so an Internet outage cannot disable the installation.

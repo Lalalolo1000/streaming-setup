@@ -178,3 +178,7 @@ YouTube `LOGIN_REQUIRED` is treated specially: Streamlink performs only a few in
 ## Reliable Stop / Restart
 
 Each stream generation now runs in its own process group. Stop/Restart first terminates that complete group, which includes the supervisor, Streamlink, VLC and helper children such as ffmpeg/mux processes. A `/proc` scan remains as compatibility cleanup for older generations. This avoids YouTube-specific child processes surviving a Stop action.
+
+## Conservative boot startup
+
+At controller startup the sequence is now: mandatory bounded GitHub preflight → web controller starts → 60-second worker boot-settle delay → Stream 01, then the remaining configured streams at 5-second intervals. The delay can be changed with `STREAM_MASTER_AUTOSTART_INITIAL_DELAY` when running `install_service.sh`.
