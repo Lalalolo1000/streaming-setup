@@ -1,0 +1,194 @@
+[
+  {
+    "name": "Stream 01",
+    "target": "pi@192.168.0.101",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 02",
+    "target": "pi@192.168.0.102",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 03",
+    "target": "pi@192.168.0.103",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 04",
+    "target": "pi@192.168.0.104",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 05",
+    "target": "pi@192.168.0.105",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 06",
+    "target": "pi@192.168.0.106",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 07",
+    "target": "pi@192.168.0.107",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 08",
+    "target": "pi@192.168.0.108",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 09",
+    "target": "pi@192.168.0.109",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 10",
+    "target": "pi@192.168.0.110",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 11",
+    "target": "pi@192.168.0.111",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 12",
+    "target": "pi@192.168.0.112",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 13",
+    "target": "pi@192.168.0.113",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 14",
+    "target": "pi@192.168.0.114",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 15",
+    "target": "pi@192.168.0.115",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 16",
+    "target": "pi@192.168.0.116",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 17",
+    "target": "pi@192.168.0.117",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 18",
+    "target": "pi@192.168.0.118",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 19",
+    "target": "pi@192.168.0.119",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 20",
+    "target": "pi@192.168.0.120",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 21",
+    "target": "pi@192.168.0.121",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 22",
+    "target": "pi@192.168.0.122",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 23",
+    "target": "pi@192.168.0.123",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  },
+  {
+    "name": "Stream 24",
+    "target": "pi@192.168.0.124",
+    "port": 22,
+    "url": "",
+    "quality": "max480",
+    "connector": "HDMI-A-1"
+  }
+]
