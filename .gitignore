@@ -1,0 +1,14 @@
+# Local installation state: never overwrite from Git
+nodes.json
+runtime/
+
+# Python/editor noise
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*~
+
+# Local secrets stay outside the repo anyway, but keep common env files out
+.env
+*.local
