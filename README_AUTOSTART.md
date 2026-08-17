@@ -102,3 +102,29 @@ The controller master is also Stream 01. It must stay writable; see `README_MAST
 At a fresh OS boot, `stream-master.service` starts and the once-per-boot worker starts every configured stream. A Git-triggered service restart during the same OS boot does not repeat the whole startup pass.
 
 Fleet reboot/shutdown actions persist their state under `runtime/`. This is important because the controller intentionally disappears when the master reboots or powers off. The master always performs its own power action last.
+
+## Unexpected worker power loss recovery
+
+The master has a low-load recovery monitor for `.102`–`.124`.
+
+- Every **30 seconds** it only tests whether TCP port 22 is reachable. This is not an authenticated SSH login and does not execute anything on the Pi.
+- The monitor starts after a **30 second initial delay**, because the normal staggered startup pass already owns the first boot period.
+- Only after a worker was actually observed offline and then reachable again does the master wait **15 seconds**, run one `check.sh` over SSH, and inspect the supervisor.
+- As a safety net for an unusually fast reboot that falls completely between two TCP probes, each worker also gets **one SSH supervisor audit about every 15 minutes**. Audits are staggered: at most one worker is audited per 30-second monitor cycle.
+- If `STATUS=running`, nothing is restarted — even when Streamlink itself is currently retrying.
+- If the `/tmp` supervisor is gone and the desired state is `running`, the master sends the current `start.sh`, URL and optional YouTube cookie again.
+- If the stream was intentionally stopped, a later Pi reboot leaves it stopped.
+
+Desired stream state is persisted locally in `runtime/desired_streams.json`. A normal master/server startup intentionally sets every configured URL back to `running`, because server startup is defined as an installation-wide restart pass.
+
+The browser dashboard's automatic SSH health refresh is **60 seconds** while the tab is visible. Manual checks remain immediate. When the dashboard is closed/hidden, those UI SSH checks do not run.
+
+Optional environment overrides:
+
+```text
+STREAM_MASTER_RECOVERY_INTERVAL=30
+STREAM_MASTER_RECOVERY_INITIAL_DELAY=30
+STREAM_MASTER_RECOVERY_BOOT_SETTLE=15
+STREAM_MASTER_RECOVERY_AUDIT_INTERVAL=900
+STREAM_MASTER_POWERLOSS_RECOVERY=1
+```

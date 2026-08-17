@@ -11,7 +11,7 @@ let checkAllPromise=null;
 let stateTimer=null;
 let autoTimer=null;
 let lastJobs={};
-const AUTO_CHECK_MS=20000;
+const AUTO_CHECK_MS=60000;
 const CHECK_CONCURRENCY=6;
 const MASTER_IP='192.168.0.101';
 
