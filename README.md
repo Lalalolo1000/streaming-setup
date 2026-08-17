@@ -44,16 +44,19 @@ nodes.json
 ./install_service.sh
 ```
 
-Installiert werden nur die Master-Grundabhängigkeiten:
+Installiert werden die Master-/Stream-Grundabhängigkeiten:
 
 ```text
 python3
 openssh-client
 sshpass
 git
+util-linux
+pipx + Streamlink
+VLC
 ```
 
-Keine Flask-/Node-/npm-/Datenbank-Abhängigkeit.
+Der Master ist zugleich Stream 01 und bekommt deshalb VLC/Streamlink lokal mitinstalliert. Es gibt weiterhin keine Flask-/Node-/npm-/Datenbank-Abhängigkeit. Für unbeaufsichtigte lokale Reboot-/Shutdown-/Update-Aktionen prüft der Installer außerdem, dass `sudo -n` für den dedizierten Master-Benutzer funktioniert.
 
 Weboberfläche:
 
@@ -107,6 +110,7 @@ Für Fernwartung nur des Masters siehe **README_REMOTE_ACCESS.md**.
 - `README_GITHUB_UPDATES.md` – GitHub-Workflow von zuhause
 - `README_REMOTE_ACCESS.md` – optional Tailscale
 - `README_STREAMING_SETUP.md` – UI/Projektbesonderheiten
+- `README_HARDENING.md` – 24/7-Schutz, Last, Recovery und Betriebsgrenzen
 
 ## Master is also Stream 01 (.101)
 
@@ -137,7 +141,7 @@ It must not print `overlay`.
 - `Alle neu starten`: all worker Pis are rebooted and allowed to come back first; the master reboots **last**.
 - `Alle herunterfahren`: all worker Pis are shut down first; the master powers off **last**.
 - `Alle aktualisieren`: worker Pis use the existing OverlayFS-safe two-reboot updater. The master is never sent through that updater. Instead its VLC + Streamlink packages are updated locally without rebooting or toggling OverlayFS.
-- A single-node OverlayFS update of the master is rejected intentionally.
+- The master's per-node update button runs the local VLC + Streamlink updater. The worker OverlayFS updater itself still rejects the master intentionally.
 
 The controller recognizes only one master. Do not mark a second node as `role=master`.
 
@@ -146,7 +150,7 @@ The controller recognizes only one master. Do not mark a second node as `role=ma
 
 Bei **jedem Start des Streaming-Setup-Servers** werden alle Nodes mit konfigurierter URL einmal neu gestartet: `.101` zuerst, danach die übrigen Nodes mit standardmäßig 5 Sekunden Abstand. Noch bootende Pis werden bis zu 15 Minuten in späteren, ebenfalls gedrosselten Runden erneut versucht. Danach übernimmt auf jedem Pi der lokale Stream-Supervisor.
 
-Der Supervisor behandelt vorübergehende Streamlink-Fehler innerhalb eines laufenden Versuchs nicht sofort als endgültigen Quellenfehler. Die äußeren Neustartabstände sind bewusst flach: **5, 10, 15, 20, 25, maximal 30 Sekunden**. Nach vielen schnellen Fehlern folgt eine kurze 60-Sekunden-Pause.
+Der Supervisor behandelt vorübergehende Streamlink-Fehler innerhalb eines laufenden Versuchs nicht sofort als endgültigen Quellenfehler. Normale äußere Neustartabstände sind **30, 60, 90, 120, 150 und maximal 180 Sekunden**, jeweils mit etwas Zufalls-Jitter. Nach zehn schnellen Fehlern folgt zunächst eine ca. 5-minütige Pause; bei dauerhaft toten Quellen steigt diese Schonzeit stufenweise bis maximal etwa 60 Minuten und wird nach einem stabilen Lauf wieder zurückgesetzt.
 
 
 ## Optional YouTube cookies
@@ -173,7 +177,7 @@ Whenever a YouTube stream is started/restarted, the master sends the cookie file
 
 Workers therefore do not need a permanent secret on their OverlayFS root. The cookie is used only for YouTube URLs. If the local cookie file is removed, the next Start/Restart also deletes the temporary worker copy.
 
-YouTube `LOGIN_REQUIRED` is treated specially: Streamlink performs only a few internal retries spaced 30 seconds apart, and if the bot/login challenge persists the outer watcher waits 10 minutes before trying again. Normal network/HLS/VLC errors use a deliberately slow linear retry schedule of 30, 60, 90, 120, 150 and 180 seconds, capped at 180 seconds. After repeated rapid failures, the watcher pauses for 5 minutes before starting the sequence again.
+YouTube `LOGIN_REQUIRED` is treated specially: Streamlink gets only one additional internal retry after about 30 seconds. If the bot/login challenge persists, the outer watcher starts with about 10 minutes of cooldown and increases repeated challenge cooldowns up to about one hour. Normal network/HLS/VLC errors use 30, 60, 90, 120, 150 and 180 second retries with jitter. Repeated batches of rapid failures use progressively longer 5/15/30/60-minute cooldowns. A stable run resets those penalties.
 
 ## Reliable Stop / Restart
 

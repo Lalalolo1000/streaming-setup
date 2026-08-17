@@ -5,7 +5,7 @@ The setup deliberately treats YouTube more conservatively than ordinary HLS sour
 - Starts from **Start all** and server autostart are staggered by 5 seconds.
 - Normal supervisor retries start at 30 seconds and grow to 180 seconds.
 - YouTube gets only one internal `--retry-streams=30` retry.
-- `LOGIN_REQUIRED` / bot verification gets a 10-minute cooldown.
+- `LOGIN_REQUIRED` / bot verification starts with an approximately 10-minute cooldown; repeated rapid challenge cycles progressively back off toward 20, 30 and at most about 60 minutes. A stable run resets the penalty.
 - `youtube-cookies.txt` is optional, local-only and ignored/protected from Git.
 - The built-in Streamlink YouTube plugin already sets a Chrome User-Agent, so the setup does not add its own YouTube User-Agent header.
 

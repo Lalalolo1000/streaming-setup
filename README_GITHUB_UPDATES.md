@@ -64,11 +64,11 @@ systemctl list-timers stream-master-git-update.timer
 
 ## Was beim Update passiert
 
-1. Der Updater prüft, ob gerade ein Pi-Reboot, ein VLC/Streamlink-Update oder eine Recovery läuft.
+1. Der Updater prüft, ob gerade die gestaffelte Startphase, ein Pi-Reboot, ein VLC/Streamlink-Update oder eine Recovery läuft. In diesem Fall wartet er bis zu einem späteren Timerlauf.
 2. Lokale Änderungen an **getrackten Code-Dateien** führen zum Abbruch; sie werden niemals automatisch verworfen.
 3. GitHub wird abgefragt.
 4. Nur ein **Fast-Forward** auf den konfigurierten Branch wird akzeptiert.
-5. Python- und Shell-Syntax sowie Pflichtdateien werden geprüft.
+5. Python-/Shell-Syntax, Pflichtdateien und `selftest.py` werden geprüft. Der Self-Test validiert u. a. die 24-Node-Defaultkonfiguration, Master-Ausschluss im Worker-Updater und konservative Polling-/Startup-Defaults.
 6. Schlägt diese Prüfung fehl, wird der vorherige Commit automatisch wiederhergestellt.
 7. Nur bei einem erfolgreichen Code-Update wird `stream-master.service` neu gestartet.
 
@@ -110,9 +110,9 @@ Worker nodes remain unchanged and can continue using OverlayFS.
 
 The master stream itself runs in the separate `streaming-setup-local-stream.service` cgroup. Therefore restarting `stream-master.service` after a Git update does not stop Stream 01.
 
-## Mandatory preflight at every controller start
+## Mandatory preflight once per OS boot
 
-Before `master.py` starts, `run_master.sh` performs a blocking Git preflight. Defaults:
+On the first `stream-master.service` start of each OS boot, `run_master.sh` performs a blocking Git preflight. The kernel boot ID is then recorded so an application crash/restart in the same boot does not repeatedly hit GitHub. Defaults:
 
 ```text
 attempts: 3
@@ -120,4 +120,4 @@ fetch timeout per attempt: 15 s
 retry delay: 5 s
 ```
 
-A reachable newer fast-forward commit is installed and validated before the controller starts. If GitHub cannot be reached after the bounded attempts, the last known-good local code is started. This makes the **check mandatory**, while keeping Internet/GitHub availability non-mandatory for operation.
+A reachable newer fast-forward commit is installed and validated before the controller starts. If GitHub cannot be reached after the bounded attempts, the last known-good local code is started and the periodic timer retries later. Runtime Git polling first uses `git ls-remote`; a real fetch happens only if the remote SHA changed, reducing needless writes to `.git`. Git deployment and long maintenance share `runtime/maintenance.lock`, so they cannot alter the checkout at the same time.

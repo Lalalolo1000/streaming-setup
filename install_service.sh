@@ -50,6 +50,8 @@ sudo tee "$SERVICE" >/dev/null <<EOF_UNIT
 Description=Streaming Setup Raspberry Pi stream controller
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -61,10 +63,13 @@ Environment=STREAM_MASTER_PORT=$PORT
 Environment=STREAM_MASTER_AUTOSTART=1
 Environment=STREAM_MASTER_AUTOSTART_INITIAL_DELAY=$AUTOSTART_INITIAL_DELAY
 Environment=STREAM_MASTER_MASTER_IP=$MASTER_IP
+Environment=STREAM_MASTER_WORKDIR=/dev/shm/stream-master
+Environment=STREAM_MASTER_RECOVERY_AUDIT_INTERVAL=300
+Environment=STREAM_MASTER_POST_REBOOT_SETTLE=20
 EnvironmentFile=-$GIT_ENV
 ExecStart=/bin/bash "$DIR/run_master.sh"
 Restart=on-failure
-RestartSec=3
+RestartSec=10
 # If stopped during a node software update, update_pis.py gets time to relock OverlayFS.
 KillMode=control-group
 TimeoutStopSec=780
@@ -122,6 +127,7 @@ User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$DIR
 Environment=STREAM_MASTER_MASTER_IP=$MASTER_IP
+Environment=STREAM_MASTER_WORKDIR=/dev/shm/stream-master
 ExecStart=/bin/bash "$DIR/local_stream_service.sh" start
 ExecStop=/bin/bash "$DIR/local_stream_service.sh" stop
 TimeoutStartSec=45
@@ -140,7 +146,7 @@ sudo systemctl enable --now stream-master-git-update.timer
 
 echo
 echo 'Streaming Setup wurde als stream-master.service installiert und gestartet.'
-echo "GitHub-Prüfung: zwingender Preflight bei jedem Serverstart + danach alle $GIT_INTERVAL."
+echo "GitHub-Prüfung: zwingender Preflight einmal pro OS-Boot + danach alle $GIT_INTERVAL."
 echo "Stream-Start nach Serverstart: ${AUTOSTART_INITIAL_DELAY}s Ruhezeit, danach gestaffelt."
 echo 'Status: sudo systemctl status stream-master --no-pager'
 echo 'Logs:   journalctl -u stream-master -f'

@@ -9,9 +9,8 @@ let recoveryGuard=null;
 let currentView='simple';
 let checkAllPromise=null;
 let stateTimer=null;
-let autoTimer=null;
 let lastJobs={};
-const AUTO_CHECK_MS=60000;
+const STATE_POLL_MS=5000;
 const CHECK_CONCURRENCY=6;
 const MASTER_IP='192.168.0.101';
 
@@ -266,7 +265,7 @@ function render(){
         <button class="button" data-node-button type="button" onclick="showLogs(${i})">Protokoll</button>
         <button class="button" data-node-button type="button" onclick="silentCheck(${i},true)">Jetzt prüfen</button>
         <button class="button" data-node-button type="button" onclick="openEdit(${i},true)">Vollständige Konfiguration</button>
-        ${isMaster(n)?'<button class="button" type="button" disabled title="Der Master bleibt schreibbar. Bei „Alle aktualisieren“ werden VLC + Streamlink lokal ohne Reboot aktualisiert.">Master: lokal bei „Alle aktualisieren“</button>':`<button class="button" data-node-button type="button" onclick="startUpdate(${i})">VLC + Streamlink aktualisieren</button>`}
+        ${isMaster(n)?`<button class="button" data-node-button type="button" onclick="startUpdate(${i})" title="Lokales Update auf dem schreibbaren Master, ohne OverlayFS-Umschaltung oder Reboot.">VLC + Streamlink lokal aktualisieren</button>`:`<button class="button" data-node-button type="button" onclick="startUpdate(${i})">VLC + Streamlink aktualisieren</button>`}
         <button class="button warning" data-node-button type="button" onclick="powerAction(${i},'reboot')">Pi neu starten</button>
         <button class="button danger" data-node-button type="button" onclick="powerAction(${i},'shutdown')">Herunterfahren</button>
       </div>
@@ -482,8 +481,9 @@ async function refreshState(){
   try{
     const r=await fetch('/api/state');const d=await r.json();if(!r.ok)throw new Error(humanError(d.error)||'Serverstatus konnte nicht geladen werden');
     const previous=jobs;jobs=d.jobs||{};updateState=d.update||{running:false};fleetState=d.fleet||{running:false};recoveryGuard=d.recovery_guard||null;
+    const cached=d.health||{};
+    nodes.forEach((n,i)=>{if(cached[n.target]){health.set(i,cached[n.target]);applyHealth(i,cached[n.target])}});
     applyUpdate();applyRecovery();applyJobs();
-    nodes.forEach((n,i)=>{const before=previous[n.target],after=jobs[n.target];if(before&&before.running&&after&&!after.running)setTimeout(()=>silentCheck(i,false),500)});
     lastJobs=previous;
   }catch(e){if(currentView==='admin')setNotice(`Serverstatus konnte nicht geladen werden: ${e.message}`,'bad','admin')}
 }
@@ -508,12 +508,15 @@ function applyRecovery(){
 }
 
 async function startUpdate(index){
-  if(index!=null&&isMaster(nodes[index])){setNotice('Der Master bleibt dauerhaft schreibbar. VLC + Streamlink werden auf ihm über „Alle aktualisieren“ lokal ohne Reboot aktualisiert.','warn','admin');return}
   const workers=nodes.filter(n=>!isMaster(n));
-  const label=index==null?`alle ${workers.length} Worker nacheinander + Master lokal ohne Reboot`:nodes[index].name;
+  const target=index==null?null:nodes[index];
+  const masterOnly=!!target&&isMaster(target);
+  const label=index==null?`alle ${workers.length} Worker nacheinander + Master lokal ohne Reboot`:target.name;
   const updateInfo=index==null
     ?`Die Worker werden nacheinander mit dem OverlayFS-sicheren Zwei-Neustart-Verfahren aktualisiert. Der Master bleibt online und aktualisiert VLC + Streamlink lokal ohne OverlayFS-Umschaltung oder Neustart.`
-    :`Auf diesem Worker wird OverlayFS vorübergehend deaktiviert und der Raspberry Pi zweimal neu gestartet.`;
+    :masterOnly
+      ?`Auf dem Master werden Stream 01 bei Bedarf kurz gestoppt, VLC + Streamlink lokal aktualisiert und der Stream danach wiederhergestellt. OverlayFS wird nicht umgeschaltet und der Master wird nicht neu gestartet.`
+      :`Auf diesem Worker wird OverlayFS vorübergehend deaktiviert und der Raspberry Pi zweimal neu gestartet.`;
   if(!confirm(`VLC + Streamlink auf ${label} aktualisieren?\n\n${updateInfo}\n\nWährend der Wartung nicht ausschalten.`))return;
   try{
     const body=index==null?{all:true}:{index};const r=await fetch('/api/update/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(humanError(d.error)||'Update konnte nicht gestartet werden');updateState=d;applyUpdate();setNotice('Update gestartet','warn','admin')
@@ -562,7 +565,7 @@ async function saveEdit(){
   finally{$('save-button').disabled=false}
 }
 
-async function reloadConfig(){try{await loadNodes();await silentCheckAll(false);setNotice('Konfiguration neu geladen','good')}catch(e){setNotice(`Konfiguration konnte nicht neu geladen werden: ${e.message}`,'bad')}}
+async function reloadConfig(){try{await loadNodes();await refreshState();setNotice('Konfiguration neu geladen','good')}catch(e){setNotice(`Konfiguration konnte nicht neu geladen werden: ${e.message}`,'bad')}}
 
 function openUpdateLog(){showDetails('Update- / Wiederherstellungsprotokoll',updateState.output||'(Noch keine Ausgabe)')}
 
@@ -584,13 +587,14 @@ document.querySelectorAll('[data-fleet-action]').forEach(b=>b.addEventListener('
 
 window.openEdit=openEdit;window.powerAction=powerAction;window.runOne=runOne;window.silentCheck=silentCheck;window.startUpdate=startUpdate;window.showLogs=showLogs;
 
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){refreshState();silentCheckAll(false)}});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshState()});
 
 async function boot(){
   setView('simple');
-  try{await loadNodes();await refreshState();await silentCheckAll(false);setNotice('','');}
+  try{await loadNodes();await refreshState();setNotice('','');}
   catch(e){setNotice(`Startfehler: ${e.message}`,'bad')}
-  stateTimer=setInterval(refreshState,2000);
-  autoTimer=setInterval(()=>{if(!document.hidden&&!updateState.running)silentCheckAll(false)},AUTO_CHECK_MS);
+  // Poll cached master state only. Background worker SSH is owned by the
+  // server-side 5-minute audit; browsers no longer multiply SSH traffic.
+  stateTimer=setInterval(()=>{if(!document.hidden)refreshState()},STATE_POLL_MS);
 }
 boot();

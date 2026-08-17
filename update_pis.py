@@ -28,6 +28,7 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -49,10 +50,16 @@ SSH_PASSWORD_FILE = Path.home() / ".config" / "stream-master" / "ssh-password"
 MASTER_IP = os.environ.get("STREAM_MASTER_MASTER_IP", "192.168.0.101")
 RUNTIME_DIR = APP_DIR / "runtime"
 GUARD_FILE = RUNTIME_DIR / "update_guard.json"
+DESIRED_STATE_FILE = RUNTIME_DIR / "desired_streams.json"
+MAINTENANCE_LOCK_FILE = RUNTIME_DIR / "maintenance.lock"
+YOUTUBE_COOKIE_FILE = APP_DIR / "youtube-cookies.txt"
+REMOTE_YOUTUBE_COOKIE_FILE = "/tmp/stream-master/youtube-cookies.txt"
+YOUTUBE_COOKIE_MAX_BYTES = 2 * 1024 * 1024
 
 SSH_CONNECT_TIMEOUT = 6
 REBOOT_DOWN_TIMEOUT = 60
 REBOOT_UP_TIMEOUT = 300
+POST_REBOOT_SETTLE = float(os.environ.get("STREAM_MASTER_UPDATE_REBOOT_SETTLE", "10"))
 
 
 class UpdateError(RuntimeError):
@@ -72,13 +79,29 @@ def write_guard(node: dict, *, stage: str, maintenance_open: bool, start_after: 
         "updated_at": time.time(),
     }
     tmp = GUARD_FILE.with_name(GUARD_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(GUARD_FILE)
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.chmod(0o600)
+    os.replace(tmp, GUARD_FILE)
+    try:
+        dir_fd = os.open(RUNTIME_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try: os.fsync(dir_fd)
+        finally: os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def clear_guard() -> None:
     try:
         GUARD_FILE.unlink()
+        try:
+            dir_fd = os.open(RUNTIME_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try: os.fsync(dir_fd)
+            finally: os.close(dir_fd)
+        except OSError:
+            pass
     except FileNotFoundError:
         pass
 
@@ -91,6 +114,42 @@ def read_guard() -> dict:
     if not isinstance(value, dict) or not isinstance(value.get("node"), dict):
         raise UpdateError("Recovery guard is invalid")
     return value
+
+
+def acquire_maintenance_lock():
+    """Lock against Git/fleet maintenance when this updater is run manually.
+
+    The web controller can pass an already-locked fd through exec. Keeping that
+    descriptor open here preserves the lock even if the controller process dies
+    while this updater is recovering an OverlayFS worker.
+    """
+    inherited = os.environ.get("STREAM_MASTER_MAINTENANCE_LOCK_FD", "")
+    if inherited.isdigit():
+        fd = int(inherited)
+        try:
+            os.fstat(fd)
+        except OSError as exc:
+            raise UpdateError("inherited maintenance lock fd is invalid") from exc
+        return fd
+    if os.environ.get("STREAM_MASTER_MAINTENANCE_LOCK_HELD") == "1":
+        return None
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(MAINTENANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise UpdateError("another maintenance/Git operation owns the global lock") from exc
+    return fd
+
+
+def release_maintenance_lock(fd) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _interrupt(signum, frame):
@@ -107,11 +166,23 @@ def read_nodes() -> list[dict]:
         if not isinstance(value, list):
             raise UpdateError("nodes.default.json must contain a JSON list")
         tmp = NODES_FILE.with_name(NODES_FILE.name + ".tmp")
-        tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        tmp.replace(NODES_FILE)
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+            handle.flush(); os.fsync(handle.fileno())
+        tmp.chmod(0o600)
+        os.replace(tmp, NODES_FILE)
     value = json.loads(NODES_FILE.read_text(encoding="utf-8"))
     if not isinstance(value, list):
         raise UpdateError("nodes.json must contain a JSON list")
+    targets = [str(node.get("target", "")) for node in value if isinstance(node, dict)]
+    if len(targets) != len(value) or any(not target for target in targets):
+        raise UpdateError("nodes.json contains an invalid node entry")
+    duplicates = sorted({target for target in targets if targets.count(target) > 1})
+    if duplicates:
+        raise UpdateError("nodes.json contains duplicate SSH target(s): " + ", ".join(duplicates))
+    masters = [node for node in value if is_master_node(node)]
+    if len(masters) != 1:
+        raise UpdateError(f"nodes.json must contain exactly one master; found {len(masters)}")
     return value
 
 
@@ -290,6 +361,7 @@ def run_local_script(
     node: dict,
     script_path: Path,
     remote_args: list[str] | None = None,
+    payload_prefix: bytes = b"",
 ) -> tuple[int, str]:
     remote_args = remote_args or []
     if not script_path.is_file():
@@ -304,7 +376,7 @@ def run_local_script(
 
     done = subprocess.run(
         ssh_base(node) + [remote],
-        input=script_path.read_bytes(),
+        input=payload_prefix + script_path.read_bytes(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=60,
@@ -364,7 +436,9 @@ def reboot_and_wait(node: dict) -> None:
         )
 
     wait_for_ssh(node, online=True, timeout=REBOOT_UP_TIMEOUT)
-    time.sleep(2)
+    if POST_REBOOT_SETTLE > 0:
+        print(f"[{name}] boot settle {POST_REBOOT_SETTLE:g}s before continuing.", flush=True)
+        time.sleep(POST_REBOOT_SETTLE)
 
 
 def preflight(node: dict) -> None:
@@ -454,9 +528,32 @@ def update_vlc_and_streamlink(node: dict) -> None:
         r'''set -eu
 export DEBIAN_FRONTEND=noninteractive
 export LC_ALL=C
+export PIP_NO_CACHE_DIR=1
+
+echo '===== clock sanity ====='
+NOW_EPOCH="$(date +%s)"
+if [ "$NOW_EPOCH" -lt 1735689600 ] || [ "$NOW_EPOCH" -gt 2082758400 ]; then
+    echo 'ERROR: system clock is implausible; refusing package-signature update.' >&2
+    exit 25
+fi
+if command -v timedatectl >/dev/null 2>&1; then
+    SYNC="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [ "$SYNC" = no ]; then
+        echo 'NTP is not synchronized yet; waiting up to 60 seconds.'
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            sleep 5
+            SYNC="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+            [ "$SYNC" != no ] && break
+        done
+    fi
+    echo "ntp_synchronized=${SYNC:-unknown}"
+    [ "$SYNC" != no ] || { echo 'ERROR: NTP is still unsynchronized; refusing repository update.' >&2; exit 26; }
+fi
 
 echo '===== apt update ====='
 sudo -n apt-get \
+    -o APT::Update::Error-Mode=any \
+    -o DPkg::Lock::Timeout=120 \
     -o Acquire::Retries=3 \
     -o Acquire::http::Timeout=30 \
     -o Acquire::https::Timeout=30 \
@@ -465,6 +562,7 @@ sudo -n apt-get \
 echo '===== VLC only-upgrade ====='
 sudo -n apt-get \
     -y \
+    -o DPkg::Lock::Timeout=120 \
     -o Acquire::Retries=3 \
     -o Acquire::http::Timeout=30 \
     -o Acquire::https::Timeout=30 \
@@ -518,6 +616,7 @@ sudo -n mkdir -p /var/lib/stream-master
     printf 'UPDATE_KIND=vlc+streamlink\n'
 } | sudo -n tee /var/lib/stream-master/update-info >/dev/null
 sudo -n chmod 0644 /var/lib/stream-master/update-info
+sudo -n apt-get clean
 sudo -n sync
 
 echo "last_update_utc=$UPDATED_UTC"
@@ -626,15 +725,32 @@ def start_stream(node: dict) -> None:
         return
     start_script = SCRIPTS_DIR / "start.sh"
     if not start_script.is_file():
-        print(f"[{node_name(node)}] no scripts/start.sh; not restarting stream.", flush=True)
-        return
+        raise UpdateError(f"{node_name(node)}: scripts/start.sh is missing; refusing to report update success without restart support")
 
+    url = str(node.get("url", "")).strip()
     args = [
-        str(node.get("url", "")),
+        url,
         str(node.get("quality", "max480")),
         str(node.get("connector", "HDMI-A-1")),
+        REMOTE_YOUTUBE_COOKIE_FILE,
     ]
-    code, output = run_local_script(node, start_script, args)
+    prefix = bytearray(b"umask 077\nmkdir -p /tmp/stream-master\n")
+    is_youtube = bool(re.search(r"(?:youtube\.com|youtu\.be)/", url, re.I))
+    if is_youtube and YOUTUBE_COOKIE_FILE.is_file():
+        cookie = YOUTUBE_COOKIE_FILE.read_bytes()
+        if len(cookie) > YOUTUBE_COOKIE_MAX_BYTES:
+            raise UpdateError(f"youtube-cookies.txt exceeds {YOUTUBE_COOKIE_MAX_BYTES} bytes")
+        marker = f"__STREAMING_SETUP_COOKIE_{os.getpid()}_{time.time_ns()}__"
+        while marker.encode() in cookie:
+            marker += "X"
+        prefix.extend(f"cat > {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)} <<'{marker}'\n".encode())
+        prefix.extend(cookie)
+        if cookie and not cookie.endswith(b"\n"):
+            prefix.extend(b"\n")
+        prefix.extend(f"{marker}\nchmod 600 {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)}\n".encode())
+    else:
+        prefix.extend(f"rm -f {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)}\n".encode())
+    code, output = run_local_script(node, start_script, args, bytes(prefix))
     if code != 0:
         raise UpdateError(
             f"{node_name(node)}: start.sh failed with rc={code}"
@@ -712,7 +828,11 @@ def update_node(node: dict, *, start_after: bool) -> None:
             write_guard(node, stage="filesystem protected; stream restart failed", maintenance_open=False, start_after=start_after, note=str(exc))
             print(f"[{name}] RECOVERY ERROR: {exc}", file=sys.stderr, flush=True)
 
-    if not maintenance_open and not recovery_errors:
+    # The guard protects against an unexpectedly writable worker. Once OverlayFS
+    # has been positively verified again, clear it even if only the stream restart
+    # failed. The five-minute supervisor audit can recover a missing stream; a
+    # non-dangerous stream error must not block Git or later worker updates.
+    if not maintenance_open:
         clear_guard()
 
     detail = str(original_error) if original_error is not None else "unknown update failure"
@@ -783,6 +903,28 @@ def select_nodes(nodes: list[dict], selectors: list[str], all_nodes: bool) -> li
     return selected
 
 
+def desired_start_after(node: dict, fallback: bool) -> bool:
+    """Respect the master's persisted operator intent during maintenance.
+
+    Manual CLI use keeps the historical --start-after behavior unless
+    --respect-desired-state is explicitly selected.
+    """
+    if not str(node.get("url", "")).strip():
+        return False
+    try:
+        value = json.loads(DESIRED_STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback
+    if not isinstance(value, dict):
+        return fallback
+    state = value.get(str(node.get("target", "")))
+    if state == "stopped":
+        return False
+    if state == "running":
+        return True
+    return fallback
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Update VLC + Streamlink on OverlayFS-protected worker Raspberry Pis (master excluded)."
@@ -803,11 +945,25 @@ def main() -> int:
         help="run scripts/start.sh after the final reboot",
     )
     parser.add_argument(
+        "--respect-desired-state",
+        action="store_true",
+        help="when used with --start-after, keep nodes intentionally stopped in runtime/desired_streams.json stopped",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="continue to later nodes if one node fails",
     )
     args = parser.parse_args()
+
+    try:
+        _maintenance_fd = acquire_maintenance_lock()
+    except UpdateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 3
+    # The fd intentionally stays open until process exit. It may be this process's
+    # own lock or the controller's inherited locked fd; either way the kernel keeps
+    # maintenance mutually exclusive through recovery and releases it on exit.
 
     if args.recover_guard:
         try:
@@ -837,7 +993,8 @@ def main() -> int:
 
     for node in selected:
         try:
-            update_node(node, start_after=args.start_after)
+            node_start_after = desired_start_after(node, args.start_after) if args.respect_desired_state else args.start_after
+            update_node(node, start_after=node_start_after)
         except (UpdateError, OSError, subprocess.SubprocessError) as exc:
             name = node_name(node)
             failures.append((name, str(exc)))
@@ -847,6 +1004,17 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
+            # Continuing is safe only if update_node fully restored/verified
+            # OverlayFS and cleared the guard. Never overwrite an unresolved
+            # safety guard with the next node's state.
+            guard = None
+            try:
+                guard = read_guard()
+            except UpdateError:
+                guard = None
+            if guard is not None:
+                print(f"[{name}] STOPPING FLEET UPDATE: recovery guard remains; later nodes are untouched.", file=sys.stderr, flush=True)
+                break
             if not args.continue_on_error:
                 break
 

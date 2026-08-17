@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import json
 import math
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +40,7 @@ NODE_JOBS_FILE = RUNTIME_DIR / "node_jobs.json"
 FLEET_JOB_FILE = RUNTIME_DIR / "fleet_job.json"
 STARTUP_STATE_FILE = RUNTIME_DIR / "startup_autostart.json"
 DESIRED_STATE_FILE = RUNTIME_DIR / "desired_streams.json"
+MAINTENANCE_LOCK_FILE = RUNTIME_DIR / "maintenance.lock"
 SSH_PASSWORD_FILE = Path.home() / ".config" / "stream-master" / "ssh-password"
 YOUTUBE_COOKIE_FILE = APP_DIR / "youtube-cookies.txt"
 REMOTE_YOUTUBE_COOKIE_FILE = "/tmp/stream-master/youtube-cookies.txt"
@@ -60,9 +63,12 @@ RECOVERY_MONITOR_INITIAL_DELAY = float(os.environ.get("STREAM_MASTER_RECOVERY_IN
 RECOVERY_BOOT_SETTLE = float(os.environ.get("STREAM_MASTER_RECOVERY_BOOT_SETTLE", "15"))
 RECOVERY_TCP_TIMEOUT = float(os.environ.get("STREAM_MASTER_RECOVERY_TCP_TIMEOUT", "1.0"))
 RECOVERY_SAFETY_AUDIT_INTERVAL = float(os.environ.get("STREAM_MASTER_RECOVERY_AUDIT_INTERVAL", "300"))
+POST_REBOOT_STREAM_SETTLE = float(os.environ.get("STREAM_MASTER_POST_REBOOT_SETTLE", "20"))
+FLEET_REBOOT_BATCH_SIZE = max(1, int(os.environ.get("STREAM_MASTER_REBOOT_BATCH_SIZE", "4")))
+FLEET_REBOOT_BATCH_PAUSE = float(os.environ.get("STREAM_MASTER_REBOOT_BATCH_PAUSE", "8"))
 
-SCRIPT_ACTIONS = {"start", "check", "logs", "kill", "reboot", "shutdown"}
-NORMAL_ACTIONS = {"start", "check", "logs", "kill"}
+SCRIPT_ACTIONS = {"start", "check", "probe", "logs", "kill", "reboot", "shutdown"}
+NORMAL_ACTIONS = {"start", "check", "probe", "logs", "kill"}
 
 UPDATE_LOCK = threading.RLock()
 CONFIG_LOCK = threading.RLock()
@@ -71,11 +77,18 @@ JOBS_LOCK = threading.RLock()
 FLEET_LOCK = threading.RLock()
 DESIRED_LOCK = threading.RLock()
 RECOVERY_LOCK = threading.RLock()
+HEALTH_LOCK = threading.RLock()
 NODE_LOCKS: dict[str, threading.Lock] = {}
 NODE_JOBS: dict[str, dict] = {}
 FLEET_JOB: dict = {"running": False, "kind": None, "stage": None, "message": None, "started_at": None, "finished_at": None, "ok": None}
 DESIRED_STREAMS: dict[str, str] = {}
 RECOVERY_NODES: dict[str, dict] = {}
+HEALTH_CACHE: dict[str, dict] = {}
+UPDATE_PERSIST_LAST = 0.0
+STARTUP_FIRST_PASS_DONE = threading.Event()
+JOB_MAINTENANCE_HOLD_LOCK = threading.RLock()
+JOB_MAINTENANCE_HOLD_FD: int | None = None
+JOB_MAINTENANCE_HOLD_COUNT = 0
 
 UPDATE_STATE: dict = {
     "running": False,
@@ -98,6 +111,88 @@ class NodeBusy(RuntimeError):
 
 def now() -> float:
     return time.time()
+
+
+@contextmanager
+def maintenance_lock(*, blocking: bool = False):
+    """Cross-process lock shared with the Git updater and manual updater.
+
+    Long maintenance operations hold this lock so Git cannot fast-forward the
+    checkout while an OverlayFS update or fleet power operation is in flight.
+    """
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(MAINTENANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, flags)
+            acquired = True
+        except BlockingIOError as exc:
+            raise NodeBusy("another maintenance/Git operation owns the global lock") from exc
+        yield fd
+    finally:
+        # Close rather than issuing LOCK_UN explicitly. If this fd was passed to
+        # a child updater, Linux keeps the flock attached to the shared open-file
+        # description until the last inherited fd closes. That protects recovery
+        # even if the controller disappears first.
+        os.close(fd)
+
+
+def acquire_job_maintenance_hold() -> None:
+    """Hold the cross-process lock while one or more standalone power jobs run.
+
+    Multiple node jobs in this Python process share a single flock, so two manual
+    reboots do not fail merely because each other is active. Git still sees one
+    exclusive lock for the whole period. Fleet/update paths own their own lock.
+    """
+    global JOB_MAINTENANCE_HOLD_FD, JOB_MAINTENANCE_HOLD_COUNT
+    with JOB_MAINTENANCE_HOLD_LOCK:
+        if JOB_MAINTENANCE_HOLD_COUNT == 0:
+            RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+            fd = os.open(MAINTENANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(fd)
+                raise NodeBusy("another maintenance/Git operation owns the global lock") from exc
+            JOB_MAINTENANCE_HOLD_FD = fd
+        JOB_MAINTENANCE_HOLD_COUNT += 1
+
+
+def release_job_maintenance_hold() -> None:
+    global JOB_MAINTENANCE_HOLD_FD, JOB_MAINTENANCE_HOLD_COUNT
+    with JOB_MAINTENANCE_HOLD_LOCK:
+        if JOB_MAINTENANCE_HOLD_COUNT <= 0:
+            return
+        JOB_MAINTENANCE_HOLD_COUNT -= 1
+        if JOB_MAINTENANCE_HOLD_COUNT == 0 and JOB_MAINTENANCE_HOLD_FD is not None:
+            fd = JOB_MAINTENANCE_HOLD_FD
+            JOB_MAINTENANCE_HOLD_FD = None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def durable_json_write(path: Path, value: object, mode: int = 0o600) -> None:
+    """Atomic + fsynced write for configuration/safety-critical state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.chmod(mode)
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def atomic_json_write(path: Path, value: object, mode: int = 0o644) -> None:
@@ -124,7 +219,7 @@ def ensure_local_nodes_file() -> None:
     value = json.loads(NODES_DEFAULT_FILE.read_text(encoding="utf-8"))
     if not isinstance(value, list):
         raise ValueError("nodes.default.json must contain a JSON list")
-    atomic_json_write(NODES_FILE, value)
+    durable_json_write(NODES_FILE, value, 0o600)
 
 
 def read_nodes() -> list[dict]:
@@ -135,7 +230,12 @@ def read_nodes() -> list[dict]:
         return []
     if not isinstance(value, list):
         raise ValueError("nodes.json must contain a JSON list")
-    return value
+    # Validate even when nodes.json was edited manually. Locks, desired state and
+    # jobs are keyed by target, so accepting a malformed/duplicate target here
+    # would be much more dangerous than rejecting the configuration early.
+    normalized = [validate_node(item) for item in value]
+    validate_nodes_collection(normalized)
+    return normalized
 
 
 def validate_node(value: object) -> dict:
@@ -178,8 +278,25 @@ def validate_node(value: object) -> dict:
     return {"name": name, "target": target, "port": port, "url": url, "quality": quality, "connector": connector, "role": role}
 
 
+def validate_nodes_collection(nodes: list[dict]) -> None:
+    targets = [node_key(n) for n in nodes]
+    duplicates = sorted({t for t in targets if targets.count(t) > 1})
+    if duplicates:
+        raise ValueError("duplicate SSH target(s): " + ", ".join(duplicates))
+    masters = [n for n in nodes if is_master_node(n)]
+    if len(masters) != 1:
+        raise ValueError(f"configuration must contain exactly one master node; found {len(masters)}")
+
+
 def write_nodes(nodes: list[dict]) -> None:
-    atomic_json_write(NODES_FILE, nodes)
+    validate_nodes_collection(nodes)
+    if NODES_FILE.is_file():
+        try:
+            backup = NODES_FILE.with_name(NODES_FILE.name + ".bak")
+            shutil.copy2(NODES_FILE, backup)
+        except OSError:
+            pass
+    durable_json_write(NODES_FILE, nodes, 0o600)
 
 
 def node_key(node: dict) -> str:
@@ -220,7 +337,16 @@ def load_desired_states() -> None:
 
 def save_desired_states() -> None:
     with DESIRED_LOCK:
-        atomic_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS)
+        durable_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS, 0o600)
+
+
+def set_desired_states_bulk(states: dict[str, str]) -> None:
+    with DESIRED_LOCK:
+        for target, state in states.items():
+            if state not in {"running", "stopped"}:
+                raise ValueError("invalid desired stream state")
+            DESIRED_STREAMS[target] = state
+        durable_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS, 0o600)
 
 
 def set_desired_state(node: dict, state: str) -> None:
@@ -229,14 +355,14 @@ def set_desired_state(node: dict, state: str) -> None:
     target = node_key(node)
     with DESIRED_LOCK:
         DESIRED_STREAMS[target] = state
-        atomic_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS)
+        durable_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS, 0o600)
 
 
 def remove_desired_state(target: str) -> None:
     with DESIRED_LOCK:
         if target in DESIRED_STREAMS:
             DESIRED_STREAMS.pop(target, None)
-            atomic_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS)
+            durable_json_write(DESIRED_STATE_FILE, DESIRED_STREAMS, 0o600)
 
 
 def desired_state(node: dict) -> str:
@@ -253,6 +379,36 @@ def desired_snapshot() -> dict[str, str]:
         return dict(DESIRED_STREAMS)
 
 
+def cache_health(node: dict, data: dict[str, str], *, source: str = "probe") -> None:
+    item = dict(data)
+    item["CACHE_SOURCE"] = source
+    item["CACHE_UPDATED_AT"] = str(now())
+    with HEALTH_LOCK:
+        HEALTH_CACHE[node_key(node)] = item
+
+
+def cache_health_failure(node: dict, failure: str | None, output: str = "") -> None:
+    reason = {
+        "node_unreachable": "Node could not be checked",
+        "ssh_auth_failed": "SSH authentication failed",
+        "ssh_host_key_changed": "Saved SSH host key no longer matches this Pi",
+        "ssh_failed": "SSH failed",
+    }.get(failure or "", "Remote check failed")
+    cache_health(node, {
+        "STATUS": "stopped",
+        "STREAM_HEALTH": failure or "remote_command_failed",
+        "STREAM_REASON": reason,
+        "STREAM_SOURCE": "unknown",
+        "SELECTED_STREAM": "unknown",
+        "STREAM_RETRY_IN": "0",
+    }, source="error")
+
+
+def health_snapshot() -> dict[str, dict]:
+    with HEALTH_LOCK:
+        return {k: dict(v) for k, v in HEALTH_CACHE.items()}
+
+
 def fleet_running() -> bool:
     with FLEET_LOCK:
         return bool(FLEET_JOB.get("running"))
@@ -260,14 +416,14 @@ def fleet_running() -> bool:
 
 def save_fleet_job() -> None:
     with FLEET_LOCK:
-        atomic_json_write(FLEET_JOB_FILE, FLEET_JOB)
+        durable_json_write(FLEET_JOB_FILE, FLEET_JOB, 0o600)
 
 
 def set_fleet_job(**changes) -> dict:
     with FLEET_LOCK:
         FLEET_JOB.update(changes)
         snapshot = dict(FLEET_JOB)
-        atomic_json_write(FLEET_JOB_FILE, FLEET_JOB)
+        durable_json_write(FLEET_JOB_FILE, FLEET_JOB, 0o600)
         return snapshot
 
 
@@ -306,7 +462,7 @@ def any_active_jobs() -> bool:
 
 def persist_jobs() -> None:
     with JOBS_LOCK:
-        atomic_json_write(NODE_JOBS_FILE, NODE_JOBS)
+        durable_json_write(NODE_JOBS_FILE, NODE_JOBS, 0o600)
 
 
 def set_job(target: str, **changes) -> dict:
@@ -314,7 +470,7 @@ def set_job(target: str, **changes) -> dict:
         job = NODE_JOBS.setdefault(target, {"target": target})
         job.update(changes)
         snapshot = dict(job)
-        atomic_json_write(NODE_JOBS_FILE, NODE_JOBS)
+        durable_json_write(NODE_JOBS_FILE, NODE_JOBS, 0o600)
         return snapshot
 
 
@@ -345,11 +501,18 @@ def update_guard_snapshot() -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def save_update_state() -> None:
+def save_update_state(*, force: bool = False) -> None:
+    # Update subprocesses can emit hundreds of lines. Keep the live UI state in
+    # memory and persist at most every 5s; the separate safety guard is fsynced.
+    global UPDATE_PERSIST_LAST
+    t = time.monotonic()
+    if not force and t - UPDATE_PERSIST_LAST < 5.0:
+        return
     with UPDATE_LOCK:
         state = {k: v for k, v in UPDATE_STATE.items() if k != "lines"}
         state["lines"] = list(UPDATE_STATE.get("lines", []))[-500:]
     atomic_json_write(UPDATE_UI_FILE, state)
+    UPDATE_PERSIST_LAST = t
 
 
 def load_update_state() -> None:
@@ -421,7 +584,7 @@ def classify_ssh_failure(output: str, returncode: int) -> str | None:
     return "remote_command_failed"
 
 
-def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]:
+def _run_local_script_unlocked(node: dict, action: str, *, quiet: bool = False) -> tuple[int, str, str | None]:
     """Run master-node actions locally, never through SSH.
 
     Start/kill use a separate systemd unit when installed so Git restarts of the
@@ -447,7 +610,12 @@ def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str |
             except subprocess.TimeoutExpired:
                 return 124, "Local stream systemd action timed out", "remote_command_failed"
             output = done.stdout.strip() or f"{LOCAL_STREAM_SERVICE}: {action} requested"
-            return done.returncode, output, None if done.returncode == 0 else "remote_command_failed"
+            failure = None if done.returncode == 0 else "remote_command_failed"
+            if done.returncode == 0 and action == "start":
+                cache_health(node, {"STATUS":"running","STREAM_HEALTH":"starting","STREAM_REASON":"start requested","STREAM_SOURCE":"unknown","SELECTED_STREAM":"unknown","STREAM_RETRY_IN":"0"}, source="action")
+            elif done.returncode == 0 and action == "kill":
+                cache_health(node, {"STATUS":"stopped","STREAM_HEALTH":"stopped","STREAM_REASON":"stream is not running","STREAM_SOURCE":"unknown","SELECTED_STREAM":"unknown","STREAM_RETRY_IN":"0"}, source="action")
+            return done.returncode, output, failure
 
     script_path = SCRIPTS_DIR / f"{action}.sh"
     script = script_path.read_bytes()
@@ -459,8 +627,11 @@ def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str |
     command = ["bash", "-s", "--", *args]
     timeout = 30 if action == "start" else 20
     name = str(node.get("name") or node_key(node))
-    print(f"\n[{name}] LOCAL {action}.sh", flush=True)
+    if not quiet:
+        print(f"\n[{name}] LOCAL {action}.sh", flush=True)
     try:
+        local_env = dict(os.environ)
+        local_env.setdefault("STREAM_MASTER_WORKDIR", "/dev/shm/stream-master")
         done = subprocess.run(
             command,
             input=script,
@@ -469,11 +640,18 @@ def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str |
             timeout=timeout,
             check=False,
             cwd=APP_DIR,
+            env=local_env,
         )
         output = done.stdout.decode("utf-8", errors="replace").strip()
-        print(output or "(no output)", flush=True)
-        print(f"[{name}] local rc={done.returncode}", flush=True)
+        if not quiet:
+            print(output or "(no output)", flush=True)
+            print(f"[{name}] local rc={done.returncode}", flush=True)
         failure = None if done.returncode == 0 else "remote_command_failed"
+        if action in {"check", "probe"}:
+            if done.returncode == 0:
+                cache_health(node, parse_machine_output(output), source=action)
+            else:
+                cache_health_failure(node, failure, output)
         return done.returncode, output, failure
     except subprocess.TimeoutExpired as exc:
         output = "Local script timed out"
@@ -485,11 +663,11 @@ def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str |
         return 124, output.strip(), "remote_command_failed"
 
 
-def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]:
+def _run_script_unlocked(node: dict, action: str, *, quiet: bool = False) -> tuple[int, str, str | None]:
     if action not in SCRIPT_ACTIONS:
         raise ValueError("unknown action")
     if is_master_node(node):
-        return _run_local_script_unlocked(node, action)
+        return _run_local_script_unlocked(node, action, quiet=quiet)
     script_path = SCRIPTS_DIR / f"{action}.sh"
     script = script_path.read_bytes()
     payload = script
@@ -527,7 +705,8 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
     command = ssh_base(node) + [remote]
     timeout = 30 if action == "start" else 20
     name = str(node.get("name") or node_key(node))
-    print(f"\n[{name}] {action}.sh", flush=True)
+    if not quiet:
+        print(f"\n[{name}] {action}.sh", flush=True)
     try:
         done = subprocess.run(
             command,
@@ -538,9 +717,20 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
             check=False,
         )
         output = done.stdout.decode("utf-8", errors="replace").strip()
-        print(output or "(no output)", flush=True)
-        print(f"[{name}] rc={done.returncode}", flush=True)
-        return done.returncode, output, classify_ssh_failure(output, done.returncode)
+        if not quiet:
+            print(output or "(no output)", flush=True)
+            print(f"[{name}] rc={done.returncode}", flush=True)
+        failure = classify_ssh_failure(output, done.returncode)
+        if action in {"check", "probe"}:
+            if done.returncode == 0:
+                cache_health(node, parse_machine_output(output), source=action)
+            else:
+                cache_health_failure(node, failure, output)
+        elif action == "start" and done.returncode == 0:
+            cache_health(node, {"STATUS":"running","STREAM_HEALTH":"starting","STREAM_REASON":"start requested","STREAM_SOURCE":"unknown","SELECTED_STREAM":"unknown","STREAM_RETRY_IN":"0"}, source="action")
+        elif action == "kill" and done.returncode == 0:
+            cache_health(node, {"STATUS":"stopped","STREAM_HEALTH":"stopped","STREAM_REASON":"stream is not running","STREAM_SOURCE":"unknown","SELECTED_STREAM":"unknown","STREAM_RETRY_IN":"0"}, source="action")
+        return done.returncode, output, failure
     except subprocess.TimeoutExpired as exc:
         output = "SSH/script timed out"
         if exc.stdout:
@@ -548,10 +738,12 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
                 output = exc.stdout.decode("utf-8", errors="replace").strip() + "\n" + output
             except AttributeError:
                 pass
+        if action in {"check", "probe"}:
+            cache_health_failure(node, "node_unreachable", output)
         return 124, output.strip(), "node_unreachable"
 
 
-def _run_script_guarded(node: dict, action: str, *, wait_for_lock: float = 0.0) -> tuple[int, str, str | None]:
+def _run_script_guarded(node: dict, action: str, *, wait_for_lock: float = 0.0, quiet: bool = False) -> tuple[int, str, str | None]:
     """Run one node action while serializing short master-side commands.
 
     Normal UI actions stay non-blocking and return NodeBusy if another command
@@ -582,7 +774,7 @@ def _run_script_guarded(node: dict, action: str, *, wait_for_lock: float = 0.0) 
             raise RuntimeError("fleet power operation is currently running")
         if active_node_job_for(target):
             raise NodeBusy("node operation already in progress")
-        return _run_script_unlocked(node, action)
+        return _run_script_unlocked(node, action, quiet=quiet)
     finally:
         lock.release()
 
@@ -669,7 +861,12 @@ def _finish_master_reboot(node: dict) -> None:
                     raise RuntimeError("Master rebooted, but stream start failed: " + (output or failure or "unknown error"))
                 time.sleep(2)
             code, output, failure = _run_local_script_unlocked(node, "check")
-            health = parse_machine_output(output).get("STREAM_HEALTH", "unknown") if code == 0 else "unknown"
+            if code != 0:
+                raise RuntimeError("Master rebooted, but final stream check failed: " + (output or failure or "unknown error"))
+            checked = parse_machine_output(output)
+            if str(node.get("url", "")).strip() and checked.get("STATUS") != "running":
+                raise RuntimeError("Master rebooted, but its supervisor is not running")
+            health = checked.get("STREAM_HEALTH", "unknown")
             set_job(target, running=False, ok=True, stage="complete", message=f"reboot complete; stream state: {health}", finished_at=now())
         except Exception as exc:
             set_job(target, running=False, ok=False, stage="failed", message=str(exc), finished_at=now())
@@ -710,14 +907,22 @@ def _reboot_worker(node: dict, resume: bool = False) -> None:
             if not wait_for_node(node, online=True, timeout=REBOOT_UP_TIMEOUT):
                 raise RuntimeError("Pi did not return to SSH after reboot")
 
-            set_job(target, stage="starting stream", message="Pi is back; starting configured stream")
+            set_job(target, stage="boot settle", message=f"Pi is back; waiting {POST_REBOOT_STREAM_SETTLE:g}s before starting the stream")
+            if POST_REBOOT_STREAM_SETTLE > 0:
+                time.sleep(POST_REBOOT_STREAM_SETTLE)
+            set_job(target, stage="starting stream", message="Pi is ready; starting configured stream")
             if str(node.get("url", "")).strip():
                 code, output, failure = _run_script_unlocked(node, "start")
                 if code != 0:
                     raise RuntimeError("Pi rebooted, but stream start failed: " + (output or failure or "unknown error"))
                 time.sleep(2)
             code, output, failure = _run_script_unlocked(node, "check")
-            health = parse_machine_output(output).get("STREAM_HEALTH", "unknown") if code == 0 else "unknown"
+            if code != 0:
+                raise RuntimeError("Pi rebooted, but final stream check failed: " + (output or failure or "unknown error"))
+            checked = parse_machine_output(output)
+            if str(node.get("url", "")).strip() and checked.get("STATUS") != "running":
+                raise RuntimeError("Pi rebooted, but its supervisor is not running")
+            health = checked.get("STREAM_HEALTH", "unknown")
             set_job(target, running=False, ok=True, stage="complete", message=f"reboot complete; stream state: {health}", finished_at=now())
         except Exception as exc:
             set_job(target, running=False, ok=False, stage="failed", message=str(exc), finished_at=now())
@@ -768,7 +973,24 @@ def start_node_job(index: int, kind: str, _from_fleet: bool = False) -> dict:
             raise NodeBusy("node operation already in progress")
         set_job(target, running=True, ok=None, kind=kind, stage="queued", message=f"{kind} queued", started_at=now(), finished_at=None, name=node.get("name"))
     worker = _reboot_worker if kind == "reboot" else _shutdown_worker
-    threading.Thread(target=worker, args=(dict(node),), daemon=True, name=f"node-{kind}-{target}").start()
+
+    def run_job() -> None:
+        # Fleet power already owns the cross-process maintenance lock. Standalone
+        # power jobs share one process-level hold so Git cannot fast-forward while
+        # any reboot/shutdown is still being supervised.
+        held = False
+        try:
+            if not _from_fleet:
+                acquire_job_maintenance_hold()
+                held = True
+            worker(dict(node), False) if kind == "reboot" else worker(dict(node))
+        except NodeBusy as exc:
+            set_job(target, running=False, ok=False, stage="failed", message=str(exc), finished_at=now())
+        finally:
+            if held:
+                release_job_maintenance_hold()
+
+    threading.Thread(target=run_job, daemon=True, name=f"node-{kind}-{target}").start()
     return jobs_snapshot()[target]
 
 
@@ -783,20 +1005,33 @@ def resume_interrupted_jobs() -> None:
             set_job(target, running=False, ok=False, stage="failed", message="node removed from config while operation was pending", finished_at=now())
             continue
         if job.get("kind") == "reboot":
-            threading.Thread(target=_reboot_worker, args=(dict(node), True), daemon=True, name=f"resume-reboot-{target}").start()
+            def resume_reboot(n=dict(node), t=target):
+                held = False
+                try:
+                    acquire_job_maintenance_hold()
+                    held = True
+                    _reboot_worker(n, True)
+                except NodeBusy as exc:
+                    set_job(t, running=False, ok=False, stage="failed", message=str(exc), finished_at=now())
+                finally:
+                    if held:
+                        release_job_maintenance_hold()
+            threading.Thread(target=resume_reboot, daemon=True, name=f"resume-reboot-{target}").start()
         elif is_master_node(node) and job.get("kind") == "shutdown":
             set_job(target, running=False, ok=True, stage="complete", message="Master was previously shut down and has now booted again", finished_at=now())
         else:
             set_job(target, running=False, ok=False, stage="interrupted", message="master restarted during shutdown request; check node state", finished_at=now())
 
 
-def _wait_for_targets_finished(targets: list[str], timeout: int) -> tuple[bool, list[str]]:
+def _wait_for_targets_success(targets: list[str], timeout: int) -> tuple[bool, list[str]]:
+    """Wait until jobs finish and require every job to report ok=True."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with JOBS_LOCK:
             running = [t for t in targets if NODE_JOBS.get(t, {}).get("running")]
-        if not running:
-            return True, []
+            if not running:
+                failed = [t for t in targets if NODE_JOBS.get(t, {}).get("ok") is not True]
+                return not failed, failed
         time.sleep(2)
     with JOBS_LOCK:
         running = [t for t in targets if NODE_JOBS.get(t, {}).get("running")]
@@ -805,41 +1040,58 @@ def _wait_for_targets_finished(targets: list[str], timeout: int) -> tuple[bool, 
 
 def _fleet_power_worker(kind: str, resume: bool = False) -> None:
     try:
-        nodes = read_nodes()
-        master = master_node(nodes)
-        workers = [n for n in nodes if not is_master_node(n)]
+        # On resume after the master reboot/power cycle the old process lock is
+        # already gone; completion only needs to observe the persisted master job.
+        lock_context = maintenance_lock(blocking=False) if not resume else nullcontext()
+        with lock_context:
+            nodes = read_nodes()
+            master = master_node(nodes)
+            workers = [(i, n) for i, n in enumerate(nodes) if not is_master_node(n)]
 
-        if not resume:
-            set_fleet_job(running=True, kind=kind, stage="workers", message=f"{kind}: worker nodes first", started_at=now(), finished_at=None, ok=None)
-            # Start all non-master power jobs. They are allowed to finish/recover
-            # while the controller stays online.
-            for i, node in enumerate(nodes):
-                if is_master_node(node):
-                    continue
-                try:
-                    start_node_job(i, kind, _from_fleet=True)
-                except NodeBusy:
-                    pass
-            targets = [node_key(n) for n in workers]
-            timeout = 600 if kind == "reboot" else 180
-            finished, remaining = _wait_for_targets_finished(targets, timeout)
-            if not finished:
-                raise RuntimeError("timed out waiting for worker nodes: " + ", ".join(remaining))
-            set_fleet_job(stage="master", message=f"{kind}: worker nodes done; master is last")
-            if master is None:
-                set_fleet_job(running=False, ok=True, stage="complete", message="fleet power operation complete", finished_at=now())
+            if not resume:
+                set_fleet_job(running=True, kind=kind, stage="workers", message=f"{kind}: worker nodes first", started_at=now(), finished_at=None, ok=None)
+                if kind == "reboot":
+                    # Small batches prevent 23 identical Pis from returning and
+                    # opening 23 source streams at nearly the same moment.
+                    for batch_start in range(0, len(workers), FLEET_REBOOT_BATCH_SIZE):
+                        batch = workers[batch_start:batch_start + FLEET_REBOOT_BATCH_SIZE]
+                        batch_no = batch_start // FLEET_REBOOT_BATCH_SIZE + 1
+                        total_batches = math.ceil(len(workers) / FLEET_REBOOT_BATCH_SIZE)
+                        set_fleet_job(stage="workers", message=f"reboot: worker batch {batch_no}/{total_batches}")
+                        for i, node in batch:
+                            start_node_job(i, kind, _from_fleet=True)
+                            time.sleep(0.5)
+                        targets = [node_key(n) for _, n in batch]
+                        ok, failed = _wait_for_targets_success(targets, 600)
+                        if not ok:
+                            raise RuntimeError("worker reboot failed; master stays online: " + ", ".join(failed))
+                        if batch_start + FLEET_REBOOT_BATCH_SIZE < len(workers) and FLEET_REBOOT_BATCH_PAUSE > 0:
+                            time.sleep(FLEET_REBOOT_BATCH_PAUSE)
+                else:
+                    # Shutdown can be issued quickly, but the master is powered off
+                    # only after every worker was positively observed offline.
+                    for i, node in workers:
+                        start_node_job(i, kind, _from_fleet=True)
+                        time.sleep(0.5)
+                    targets = [node_key(n) for _, n in workers]
+                    ok, failed = _wait_for_targets_success(targets, 240)
+                    if not ok:
+                        raise RuntimeError("worker shutdown not confirmed; master stays online: " + ", ".join(failed))
+
+                set_fleet_job(stage="master", message=f"{kind}: all workers succeeded; master is last")
+                if master is None:
+                    set_fleet_job(running=False, ok=True, stage="complete", message="fleet power operation complete", finished_at=now())
+                    return
+                mi = next(i for i, n in enumerate(nodes) if is_master_node(n))
+                start_node_job(mi, kind, _from_fleet=True)
                 return
-            mi = next(i for i,n in enumerate(nodes) if is_master_node(n))
-            start_node_job(mi, kind, _from_fleet=True)
-            # reboot/shutdown now intentionally kills this service. Completion is
-            # recorded by resume_fleet_job() on the next master boot.
-            return
 
-        # We are back after the master itself rebooted or after a later power-on.
-        mt = master_node(nodes)
-        if mt:
-            _wait_for_targets_finished([node_key(mt)], 120)
-        set_fleet_job(running=False, ok=True, stage="complete", message="fleet power operation complete", finished_at=now())
+            mt = master_node(nodes)
+            if mt:
+                ok, failed = _wait_for_targets_success([node_key(mt)], 180)
+                if not ok:
+                    raise RuntimeError("master power job did not complete successfully: " + ", ".join(failed))
+            set_fleet_job(running=False, ok=True, stage="complete", message="fleet power operation complete", finished_at=now())
     except Exception as exc:
         set_fleet_job(running=False, ok=False, stage="failed", message=str(exc), finished_at=now())
 
@@ -862,7 +1114,23 @@ def start_fleet_power(kind: str) -> dict:
 def resume_fleet_job() -> None:
     if not fleet_running():
         return
-    threading.Thread(target=_fleet_power_worker, kwargs={"kind": str(FLEET_JOB.get("kind") or "reboot"), "resume": True}, daemon=True, name="resume-fleet-power").start()
+    snapshot = fleet_snapshot()
+    # Only the intentional final master power action is resumed automatically.
+    # If the controller crashed during the worker phase, resumed per-node jobs may
+    # still complete, but the master deliberately stays online for inspection.
+    if snapshot.get("stage") != "master":
+        set_fleet_job(
+            running=False, ok=False, stage="interrupted",
+            message="controller restarted during worker fleet operation; master left online",
+            finished_at=now(),
+        )
+        return
+    threading.Thread(
+        target=_fleet_power_worker,
+        kwargs={"kind": str(snapshot.get("kind") or "reboot"), "resume": True},
+        daemon=True,
+        name="resume-fleet-power",
+    ).start()
 
 
 def save_node_config(index: int | None, value: object, apply: bool = False) -> dict:
@@ -892,6 +1160,7 @@ def save_node_config(index: int | None, value: object, apply: bool = False) -> d
                 if active_node_job_for(node_key(old)):
                     raise NodeBusy("cannot edit this node while reboot/shutdown is running")
                 nodes[index] = node
+            validate_nodes_collection(nodes)
             write_nodes(nodes)
 
         if old is not None and node_key(old) != node_key(node):
@@ -981,7 +1250,7 @@ def _append_update_line(line: str) -> None:
     save_update_state()
 
 
-def _run_master_local_package_update() -> int:
+def _run_master_local_package_update(maintenance_fd: int | None = None) -> int:
     with UPDATE_LOCK:
         UPDATE_STATE["current_node"] = "Master (.101)"
         UPDATE_STATE["stage"] = "updating master locally"
@@ -990,39 +1259,78 @@ def _run_master_local_package_update() -> int:
     if not MASTER_LOCAL_UPDATE_SCRIPT.is_file():
         _append_update_line("MASTER LOCAL UPDATE ERROR: update_master_local.sh is missing.\n")
         return 1
-    _append_update_line("\nMASTER LOCAL UPDATE: VLC + Streamlink on controller (no OverlayFS toggle, no reboot).\n")
+    _append_update_line("\nMASTER LOCAL UPDATE: stop Stream 01 if active, update VLC + Streamlink, then restore it.\n")
+    proc: subprocess.Popen[str] | None = None
     try:
+        pass_fds: tuple[int, ...] = (maintenance_fd,) if maintenance_fd is not None else ()
         proc = subprocess.Popen(
             ["/bin/bash", str(MASTER_LOCAL_UPDATE_SCRIPT)],
-            cwd=APP_DIR,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            cwd=APP_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, start_new_session=True, pass_fds=pass_fds,
         )
         assert proc.stdout is not None
-        for line in proc.stdout:
-            _append_update_line("[master-local] " + line)
-        return proc.wait()
+        q: queue.Queue[str | None] = queue.Queue()
+        def reader() -> None:
+            try:
+                for line in proc.stdout:
+                    q.put(line)
+            finally:
+                q.put(None)
+        threading.Thread(target=reader, daemon=True, name="master-local-update-output").start()
+        last_output = time.monotonic()
+        reader_done = False
+        while True:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                item = "__NO_LINE__"
+            if item is None:
+                reader_done = True
+            elif item != "__NO_LINE__":
+                _append_update_line("[master-local] " + item)
+                last_output = time.monotonic()
+            if proc.poll() is not None and reader_done and q.empty():
+                return proc.wait()
+            if time.monotonic() - last_output > 1200:
+                _append_update_line("MASTER LOCAL WATCHDOG: no output for 20 minutes; terminating update.\n")
+                os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    return proc.wait(timeout=60) or 124
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                    return 124
     except Exception as exc:
         _append_update_line(f"MASTER LOCAL UPDATE ERROR: {exc}\n")
+        if proc is not None and proc.poll() is None:
+            try: os.killpg(proc.pid, signal.SIGTERM)
+            except Exception: pass
         return 1
 
 
-def _run_update_process(command: list[str]) -> None:
+def _run_update_process(command: list[str], maintenance_fd: int | None = None) -> None:
     rc = 1
     proc: subprocess.Popen[str] | None = None
     try:
+        child_env = dict(os.environ)
+        pass_fds: tuple[int, ...] = ()
+        if maintenance_fd is not None:
+            # The updater inherits the already-locked file description. If the
+            # controller itself is stopped/crashes mid-update, the child keeps the
+            # flock while its signal handler relocks/verifies the worker.
+            child_env["STREAM_MASTER_MAINTENANCE_LOCK_FD"] = str(maintenance_fd)
+            pass_fds = (maintenance_fd,)
         proc = subprocess.Popen(
             command,
             cwd=APP_DIR,
+            env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             start_new_session=True,
+            pass_fds=pass_fds,
         )
         assert proc.stdout is not None
         line_queue: queue.Queue[str | None] = queue.Queue()
@@ -1072,9 +1380,12 @@ def _run_update_process(command: list[str]) -> None:
         with UPDATE_LOCK:
             mode = UPDATE_STATE.get("mode")
         if mode == "all":
-            local_rc = _run_master_local_package_update()
-            if local_rc != 0 and rc == 0:
-                rc = local_rc
+            if update_guard_snapshot():
+                _append_update_line("MASTER LOCAL UPDATE SKIPPED: a worker recovery guard is still open; recover that worker first.\n")
+            else:
+                local_rc = _run_master_local_package_update(maintenance_fd)
+                if local_rc != 0 and rc == 0:
+                    rc = local_rc
     except Exception as exc:
         _append_update_line(f"MASTER UPDATE ERROR: {exc}\n")
         rc = 1
@@ -1088,12 +1399,34 @@ def _run_update_process(command: list[str]) -> None:
                 except Exception:
                     pass
     finally:
-        with UPDATE_LOCK:
-            UPDATE_STATE["running"] = False
-            UPDATE_STATE["returncode"] = rc
-            UPDATE_STATE["finished_at"] = now()
-            UPDATE_STATE["stage"] = "complete" if rc == 0 else "failed"
-        save_update_state()
+        _finish_update_state(rc)
+
+
+def _finish_update_state(rc: int) -> None:
+    with UPDATE_LOCK:
+        UPDATE_STATE["running"] = False
+        UPDATE_STATE["returncode"] = rc
+        UPDATE_STATE["finished_at"] = now()
+        UPDATE_STATE["stage"] = "complete" if rc == 0 else "failed"
+    save_update_state(force=True)
+
+
+def _run_master_only_after_barrier(master_node: dict) -> None:
+    rc = 1
+    try:
+        # A master-only package update is local, but it must obey the same node
+        # action and cross-process maintenance barriers as worker maintenance.
+        lock = node_lock(master_node)
+        if not lock.acquire(timeout=45):
+            raise RuntimeError(f"timed out waiting for active node action on {node_key(master_node)}")
+        lock.release()
+        with maintenance_lock(blocking=False) as maintenance_fd:
+            rc = _run_master_local_package_update(maintenance_fd)
+    except Exception as exc:
+        _append_update_line(f"MASTER LOCAL UPDATE ERROR: {exc}\n")
+        rc = 1
+    finally:
+        _finish_update_state(rc)
 
 
 def _run_update_after_barrier(command: list[str], barrier_nodes: list[dict]) -> None:
@@ -1112,9 +1445,19 @@ def _run_update_after_barrier(command: list[str], barrier_nodes: list[dict]) -> 
             UPDATE_STATE["returncode"] = 1
             UPDATE_STATE["finished_at"] = now()
             UPDATE_STATE["stage"] = "failed before updater launch"
-        save_update_state()
+        save_update_state(force=True)
         return
-    _run_update_process(command)
+    try:
+        with maintenance_lock(blocking=False) as maintenance_fd:
+            _run_update_process(command, maintenance_fd)
+    except NodeBusy as exc:
+        _append_update_line(f"MASTER UPDATE ERROR: {exc}\n")
+        with UPDATE_LOCK:
+            UPDATE_STATE["running"] = False
+            UPDATE_STATE["returncode"] = 1
+            UPDATE_STATE["finished_at"] = now()
+            UPDATE_STATE["stage"] = "failed before updater launch"
+        save_update_state(force=True)
 
 
 def start_update(*, node_index: int | None = None, all_nodes: bool = False, recover: bool = False) -> dict:
@@ -1140,7 +1483,7 @@ def start_update(*, node_index: int | None = None, all_nodes: bool = False, reco
         workers = [n for n in nodes if not is_master_node(n)]
         if not workers:
             raise ValueError("no worker nodes are configured for OverlayFS updates")
-        command = [sys.executable, "-u", str(UPDATE_SCRIPT), "--all", "--start-after", "--continue-on-error"]
+        command = [sys.executable, "-u", str(UPDATE_SCRIPT), "--all", "--start-after", "--respect-desired-state", "--continue-on-error"]
         mode = "all"
         requested_node = None
         barrier_nodes = workers
@@ -1150,19 +1493,24 @@ def start_update(*, node_index: int | None = None, all_nodes: bool = False, reco
         if node_index is None or not 0 <= node_index < len(nodes):
             raise ValueError("invalid node index")
         node = nodes[node_index]
-        if is_master_node(node):
-            raise ValueError("the master node stays writable and is intentionally excluded from OverlayFS node updates")
         selector = str(node.get("target", ""))
-        command = [sys.executable, "-u", str(UPDATE_SCRIPT), "--node", selector, "--start-after"]
-        mode = "one"
-        requested_node = str(node.get("name") or selector)
-        barrier_nodes = [node]
+        if is_master_node(node):
+            # The master stays writable permanently. Its per-node button uses
+            # only the local VLC/Streamlink updater: no OverlayFS toggle and no
+            # reboot. Preserve the operator's desired stream state.
+            command = None
+            mode = "master"
+            requested_node = str(node.get("name") or "Master (.101)")
+            barrier_nodes = [node]
+        else:
+            command = [sys.executable, "-u", str(UPDATE_SCRIPT), "--node", selector, "--start-after", "--respect-desired-state"]
+            mode = "one"
+            requested_node = str(node.get("name") or selector)
+            barrier_nodes = [node]
 
-    # The updater is invoked with --start-after, so its desired state must match
-    # what the maintenance operation will actually do.
-    for n in barrier_nodes:
-        if isinstance(n, dict):
-            set_desired_state(n, "running" if str(n.get("url", "")).strip() else "stopped")
+    # Software maintenance preserves the operator's persisted desired stream
+    # state. The worker updater receives --respect-desired-state; the master-local
+    # updater restores Stream 01 only when it was active before maintenance.
 
     with UPDATE_LOCK:
         if UPDATE_STATE["running"]:
@@ -1174,16 +1522,20 @@ def start_update(*, node_index: int | None = None, all_nodes: bool = False, reco
             "mode": mode,
             "requested_node": requested_node,
             "current_node": requested_node,
-            "stage": "starting recovery" if recover else "starting updater",
+            "stage": "starting recovery" if recover else ("starting master-local update" if mode == "master" else "starting updater"),
             "step": 0,
-            "total_steps": 1 if recover else 5,
+            "total_steps": 1 if mode == "master" or recover else 5,
             "started_at": now(),
             "finished_at": None,
             "returncode": None,
-            "lines": ["$ " + shlex.join(command) + "\n"],
+            "lines": (["$ " + shlex.join(command) + "\n"] if command is not None else ["$ ./update_master_local.sh\n"]),
         })
-    save_update_state()
-    threading.Thread(target=_run_update_after_barrier, args=(command, barrier_nodes), daemon=True, name="pi-updater").start()
+    save_update_state(force=True)
+    if mode == "master":
+        threading.Thread(target=_run_master_only_after_barrier, args=(barrier_nodes[0],), daemon=True, name="master-local-updater").start()
+    else:
+        assert command is not None
+        threading.Thread(target=_run_update_after_barrier, args=(command, barrier_nodes), daemon=True, name="pi-updater").start()
     return _update_snapshot()
 
 
@@ -1208,8 +1560,8 @@ def recovery_snapshot() -> dict[str, dict]:
 def _powerloss_recovery_worker(target: str, boot_settle: bool = True) -> None:
     """Recover one worker after a real offline -> online transition.
 
-    We deliberately do not restart a healthy retrying supervisor. check.sh first
-    verifies whether the /tmp supervisor survived. Only STATUS!=running causes a
+    We deliberately do not restart a healthy retrying supervisor. probe.sh first
+    verifies whether the supervisor survived. Only STATUS!=running causes a
     redeploy, and only when the persisted desired state is running.
     """
     _recovery_set(target, recovering=True, pending=True, stage="boot settling" if boot_settle else "safety audit", updated_at=now())
@@ -1217,8 +1569,11 @@ def _powerloss_recovery_worker(target: str, boot_settle: bool = True) -> None:
         time.sleep(max(0.0, RECOVERY_BOOT_SETTLE))
     try:
         node = _find_node_by_target(target)
-        if node is None or is_master_node(node):
+        if node is None:
             _recovery_set(target, recovering=False, pending=False, stage="node removed", updated_at=now())
+            return
+        if not STARTUP_FIRST_PASS_DONE.is_set():
+            _recovery_set(target, recovering=False, pending=True, stage="waiting for startup first pass", updated_at=now())
             return
         if desired_state(node) != "running" or not str(node.get("url", "")).strip():
             _recovery_set(target, recovering=False, pending=False, stage="intentionally stopped", updated_at=now())
@@ -1231,15 +1586,21 @@ def _powerloss_recovery_worker(target: str, boot_settle: bool = True) -> None:
 
         _recovery_set(target, stage="checking supervisor", updated_at=now())
         try:
-            code, output, failure = _run_script_guarded(node, "check", wait_for_lock=15.0)
+            code, output, failure = _run_script_guarded(node, "probe", wait_for_lock=15.0, quiet=True)
         except (NodeBusy, RuntimeError) as exc:
             _recovery_set(target, recovering=False, pending=True, stage=f"check deferred: {exc}", updated_at=now())
             return
         data = parse_machine_output(output) if code == 0 else {}
         if code != 0:
-            # SSH may not be fully ready yet even though port 22 answered. Keep
-            # this recovery pending for the next 30-second monitor pass.
-            _recovery_set(target, recovering=False, pending=True, stage=f"SSH not ready: {failure or code}", updated_at=now())
+            # A transport failure shortly after boot is worth retrying on the next
+            # monitor pass. Persistent auth/remote-script failures are not: retry
+            # those only on the normal five-minute audit to avoid SSH hammering.
+            quick_retry = failure in {"node_unreachable", "ssh_failed"}
+            _recovery_set(
+                target, recovering=False, pending=quick_retry,
+                stage=(f"SSH not ready: {failure or code}" if quick_retry else f"probe failed; next safety audit: {failure or code}"),
+                last_audit_at=now(), updated_at=now(),
+            )
             return
         if data.get("STATUS") == "running":
             _recovery_set(target, recovering=False, pending=False, stage="supervisor already running", recovered_at=now(), last_audit_at=now(), updated_at=now())
@@ -1255,7 +1616,12 @@ def _powerloss_recovery_worker(target: str, boot_settle: bool = True) -> None:
             print(f"Power-loss recovery: {target} returned without a supervisor; stream restarted.", flush=True)
             _recovery_set(target, recovering=False, pending=False, stage="stream restarted", recovered_at=now(), last_audit_at=now(), updated_at=now())
         else:
-            _recovery_set(target, recovering=False, pending=True, stage=f"restart failed: {failure or code}", updated_at=now())
+            quick_retry = failure in {"node_unreachable", "ssh_failed"}
+            _recovery_set(
+                target, recovering=False, pending=quick_retry,
+                stage=(f"restart transport failed: {failure or code}" if quick_retry else f"restart failed; next safety audit: {failure or code}"),
+                last_audit_at=now(), updated_at=now(),
+            )
     except Exception as exc:
         print(f"Power-loss recovery error for {target}: {exc}", flush=True)
         _recovery_set(target, recovering=False, pending=True, stage=f"error: {exc}", updated_at=now())
@@ -1278,13 +1644,13 @@ def powerloss_recovery_monitor() -> None:
     # Baseline existing nodes without triggering recovery. Normal server-start
     # autostart is responsible for the initial boot of the installation.
     # Seed audit timestamps across one full interval so the first authenticated
-    # audit sweep is staggered instead of all workers becoming due at once.
-    baseline_nodes = [n for n in read_nodes() if not is_master_node(n)]
+    # audit sweep is staggered instead of all nodes becoming due at once.
+    all_baseline_nodes = read_nodes()
     baseline_now = now()
-    baseline_count = max(1, len(baseline_nodes))
-    for index, node in enumerate(baseline_nodes):
+    baseline_count = max(1, len(all_baseline_nodes))
+    for index, node in enumerate(all_baseline_nodes):
         target = node_key(node)
-        up = tcp_up(node, timeout=RECOVERY_TCP_TIMEOUT)
+        up = True if is_master_node(node) else tcp_up(node, timeout=RECOVERY_TCP_TIMEOUT)
         stagger_age = RECOVERY_SAFETY_AUDIT_INTERVAL * ((index + 1) / baseline_count)
         _recovery_set(
             target,
@@ -1306,8 +1672,9 @@ def powerloss_recovery_monitor() -> None:
     while True:
         cycle_started = time.monotonic()
         try:
-            nodes = [n for n in read_nodes() if not is_master_node(n)]
-            known_targets = {node_key(n) for n in nodes}
+            all_nodes = read_nodes()
+            nodes = [n for n in all_nodes if not is_master_node(n)]
+            known_targets = {node_key(n) for n in all_nodes}
             with RECOVERY_LOCK:
                 for stale in list(RECOVERY_NODES):
                     if stale not in known_targets:
@@ -1329,6 +1696,7 @@ def powerloss_recovery_monitor() -> None:
                     if not up:
                         if was_up is not False:
                             print(f"Power-loss monitor: {target} is offline.", flush=True)
+                            cache_health_failure(node, "node_unreachable")
                         _recovery_set(target, last_up=False, seen_down=True, stage="offline", updated_at=now())
                         continue
 
@@ -1340,7 +1708,7 @@ def powerloss_recovery_monitor() -> None:
                     else:
                         _recovery_set(target, last_up=True, updated_at=now())
 
-                    if pending and not recovering and desired_state(node) == "running" and str(node.get("url", "")).strip():
+                    if pending and not recovering and STARTUP_FIRST_PASS_DONE.is_set() and desired_state(node) == "running" and str(node.get("url", "")).strip():
                         _recovery_set(target, recovering=True, pending=True, seen_down=False, stage="recovery queued", updated_at=now())
                         threading.Thread(target=_powerloss_recovery_worker, args=(target,), daemon=True, name=f"powerloss-recovery-{target}").start()
                     elif pending and desired_state(node) != "running":
@@ -1357,8 +1725,8 @@ def powerloss_recovery_monitor() -> None:
                 eligible_count = 0
                 with UPDATE_LOCK:
                     updating = bool(UPDATE_STATE.get("running"))
-                if not updating:
-                    for node in nodes:
+                if not updating and STARTUP_FIRST_PASS_DONE.is_set():
+                    for node in all_nodes:
                         target = node_key(node)
                         with RECOVERY_LOCK:
                             st = dict(RECOVERY_NODES.get(target) or {})
@@ -1427,6 +1795,24 @@ def _write_startup_state(**changes) -> None:
     atomic_json_write(STARTUP_STATE_FILE, state)
 
 
+def schedule_lightweight_probe(node: dict, delay: float = 12.0) -> None:
+    """Refresh cached health once after an explicit automatic start.
+
+    This is a one-shot probe, not recurring browser SSH. It lets the dashboard
+    show Live/retrying soon after boot without waiting up to five minutes for the
+    regular staggered audit.
+    """
+    snapshot = dict(node)
+    def worker() -> None:
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            _run_script_guarded(snapshot, "probe", wait_for_lock=5.0, quiet=True)
+        except (NodeBusy, RuntimeError, OSError, subprocess.SubprocessError):
+            pass
+    threading.Thread(target=worker, daemon=True, name=f"post-start-probe-{node_key(snapshot)}").start()
+
+
 def _autostart_attempt(node: dict, attempts: int) -> dict:
     """Try to (re)start one configured stream exactly once.
 
@@ -1436,12 +1822,26 @@ def _autostart_attempt(node: dict, attempts: int) -> dict:
     """
     name = str(node.get("name") or node_key(node))
     target = node_key(node)
+    # Do not spend an SSH timeout on a worker that has not even opened port 22
+    # yet. This keeps the first boot pass predictably staggered when several Pis
+    # are still booting or physically absent.
+    if not is_master_node(node) and not tcp_up(node, timeout=min(1.0, RECOVERY_TCP_TIMEOUT)):
+        return {
+            "name": name,
+            "target": target,
+            "result": "pending",
+            "attempts": attempts,
+            "failure": "node_unreachable",
+            "output": "TCP/22 not ready",
+        }
     try:
         code, output, failure = run_script(node, "start")
     except (NodeBusy, RuntimeError) as exc:
         code, output, failure = 1, str(exc), "busy"
 
     if code == 0:
+        _recovery_set(target, last_up=True, seen_down=False, pending=False, recovering=False, stage="started by startup pass", updated_at=now())
+        schedule_lightweight_probe(node)
         return {
             "name": name,
             "target": target,
@@ -1477,13 +1877,16 @@ def startup_autostart_on_server_start() -> None:
     """
     if os.environ.get("STREAM_MASTER_AUTOSTART", "1") not in {"1", "yes", "true", "on"}:
         print("Startup autostart disabled by STREAM_MASTER_AUTOSTART.")
+        STARTUP_FIRST_PASS_DONE.set()
         return
 
     nodes = read_nodes()
     # A server start is an explicit installation-wide restart request. It also
     # establishes the desired state used by unexpected power-loss recovery.
-    for n in nodes:
-        set_desired_state(n, "running" if str(n.get("url", "")).strip() else "stopped")
+    set_desired_states_bulk({
+        node_key(n): ("running" if str(n.get("url", "")).strip() else "stopped")
+        for n in nodes
+    })
     configured = [n for n in nodes if str(n.get("url", "")).strip()]
     # Python's sort is stable, so worker order remains the nodes.json order.
     configured.sort(key=lambda node: 0 if is_master_node(node) else 1)
@@ -1535,6 +1938,10 @@ def startup_autostart_on_server_start() -> None:
         if pos + 1 < len(configured):
             _startup_sleep(STARTUP_AUTOSTART_STAGGER, deadline)
 
+    # The recovery monitor may now audit/recover nodes. It was explicitly gated
+    # until this point so it cannot bypass the 60s settle + staggered first pass.
+    STARTUP_FIRST_PASS_DONE.set()
+
     # Retry only Pis which were unreachable/busy. Each retry round starts no
     # sooner than STARTUP_AUTOSTART_RETRY after the previous pass and still
     # spaces individual starts, so recovery cannot turn into another burst.
@@ -1580,11 +1987,22 @@ def startup_autostart_on_server_start() -> None:
     print("Server startup stream restart pass completed.")
 
 def launch_startup_autostart() -> None:
-    threading.Thread(target=startup_autostart_on_server_start, daemon=True, name="startup-autostart").start()
+    def runner() -> None:
+        try:
+            startup_autostart_on_server_start()
+        except Exception as exc:
+            print(f"Startup autostart error: {exc}", flush=True)
+        finally:
+            # Fail open for recovery if startup orchestration itself crashes.
+            STARTUP_FIRST_PASS_DONE.set()
+    threading.Thread(target=runner, daemon=True, name="startup-autostart").start()
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
+        path = urlparse(self.path).path
+        if self.command == "GET" and path in {"/", "/index.html", "/app.js", "/style.css", "/api/state", "/api/nodes"}:
+            return
         print("[http]", fmt % args)
 
     def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
@@ -1636,7 +2054,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/nodes":
                 self.send_json({"nodes": read_nodes()})
             elif path == "/api/state":
-                self.send_json({"update": _update_snapshot(), "jobs": jobs_snapshot(), "fleet": fleet_snapshot(), "recovery_guard": update_guard_snapshot(), "desired": desired_snapshot(), "powerloss_recovery": recovery_snapshot()})
+                self.send_json({"update": _update_snapshot(), "jobs": jobs_snapshot(), "fleet": fleet_snapshot(), "recovery_guard": update_guard_snapshot(), "desired": desired_snapshot(), "powerloss_recovery": recovery_snapshot(), "health": health_snapshot()})
             elif path == "/api/update/status":
                 self.send_json(_update_snapshot())
             else:
@@ -1708,7 +2126,16 @@ def main() -> int:
     args = parser.parse_args()
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        RUNTIME_DIR.chmod(0o700)
+    except OSError:
+        pass
     ensure_local_nodes_file()
+    try:
+        NODES_FILE.chmod(0o600)
+    except OSError:
+        pass
+    validate_nodes_collection(read_nodes())
     required = [WEB_DIR / "index.html", WEB_DIR / "app.js", WEB_DIR / "style.css", UPDATE_SCRIPT, MASTER_LOCAL_UPDATE_SCRIPT, APP_DIR / "local_stream_service.sh"]
     required.extend(SCRIPTS_DIR / f"{name}.sh" for name in SCRIPT_ACTIONS)
     missing = [str(p) for p in required if not p.is_file()]

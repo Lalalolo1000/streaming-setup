@@ -4,6 +4,7 @@ set -euo pipefail
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-}"
 MASTER_IP="${STREAM_MASTER_MASTER_IP:-192.168.0.101}"
+export STREAM_MASTER_WORKDIR="${STREAM_MASTER_WORKDIR:-/dev/shm/stream-master}"
 NODES="$DIR/nodes.json"
 [ -f "$NODES" ] || NODES="$DIR/nodes.default.json"
 

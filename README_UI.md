@@ -43,9 +43,11 @@ Der Projektname selbst bleibt **Streaming Setup**.
 
 ## Master node behavior
 
-In Admin, Stream 01 / `.101` is marked **MASTER**. Its filesystem status is considered healthy when it is writable. The per-node OverlayFS update button is disabled for the master. `Alle aktualisieren` updates the 23 workers with their normal OverlayFS workflow and updates VLC + Streamlink on the master locally without rebooting it.
+In Admin, Stream 01 / `.101` is marked **MASTER**. Its filesystem status is considered healthy when it is writable. Its per-node **VLC + Streamlink lokal aktualisieren** button performs only the writable master's local package update: Stream 01 is stopped/restored as needed, with no OverlayFS toggle and no reboot. `Alle aktualisieren` updates the 23 workers with their normal OverlayFS workflow and then performs the same local VLC + Streamlink update on the master.
 
 Fleet reboot/shutdown always performs the master last so the controller remains available while worker operations are being completed.
+
+Per-node and fleet software updates preserve the desired running/stopped state. A stream that was intentionally stopped stays stopped after its package update.
 
 ## URL changes while a stream is retrying
 

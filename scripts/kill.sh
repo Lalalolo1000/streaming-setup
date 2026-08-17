@@ -2,7 +2,7 @@
 # Stop the complete controller-owned stream process group. Falls back to /proc
 # scanning for old supervisors created before process-group tracking existed.
 set -u
-WORKDIR="/tmp/stream-master"
+WORKDIR="${STREAM_MASTER_WORKDIR:-/tmp/stream-master}"
 PIDFILE="$WORKDIR/stream.pid"
 STATEFILE="$WORKDIR/status.env"
 SELF=$$
@@ -38,7 +38,7 @@ find_matching_pids() {
         [ "$pid" = "$SELF" ] && continue
         cmd="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
         case "$cmd" in
-            *"$WORKDIR/supervisor.sh"*|*/bin/streamlink\ *|*/streamlink/bin/python\ *|*/bin/cvlc\ *) printf '%s\n' "$pid" ;;
+            */stream-master/supervisor.sh*|*/bin/streamlink\ *|*/streamlink/bin/python\ *|*/bin/cvlc\ *) printf '%s\n' "$pid" ;;
         esac
     done
 }

@@ -57,7 +57,7 @@ Die Unit verwendet:
 
 ```ini
 Restart=on-failure
-RestartSec=3
+RestartSec=10
 ```
 
 Test:
@@ -99,7 +99,7 @@ Der Git-Timer überspringt Updates automatisch, solange eine solche Wartung oder
 ## Master .101 and daily power-on
 
 The controller master is also Stream 01. It must stay writable; see `README_MASTER_NODE.md`.
-At a fresh OS boot, `stream-master.service` starts and the once-per-boot worker starts every configured stream. A Git-triggered service restart during the same OS boot does not repeat the whole startup pass.
+At a fresh OS boot, `stream-master.service` starts the configured streams after the boot-settle delay. A later restart of `stream-master.service` in the same OS boot deliberately runs the same staggered installation-wide Start/Restart pass again; only the mandatory Git preflight itself is limited to once per OS boot.
 
 Fleet reboot/shutdown actions persist their state under `runtime/`. This is important because the controller intentionally disappears when the master reboots or powers off. The master always performs its own power action last.
 
@@ -117,7 +117,7 @@ The master has a low-load recovery monitor for `.102`–`.124`.
 
 Desired stream state is persisted locally in `runtime/desired_streams.json`. A normal master/server startup intentionally sets every configured URL back to `running`, because server startup is defined as an installation-wide restart pass.
 
-The browser dashboard's automatic SSH health refresh is **60 seconds** while the tab is visible. Manual checks remain immediate. When the dashboard is closed/hidden, those UI SSH checks do not run.
+The browser no longer performs recurring fleet SSH checks. It polls cached state from the master every 5 seconds. The server-side five-minute audit is the authoritative recurring supervisor check. Manual **Jetzt prüfen** and the short follow-up checks after an explicit Start/Edit still perform real checks.
 
 Optional environment overrides:
 
@@ -141,6 +141,6 @@ STREAM_MASTER_AUTOSTART_INITIAL_DELAY=90 ./install_service.sh
 
 The initial settle delay does **not** consume the 15-minute retry window for late/offline Pis.
 
-## Mandatory Git preflight on service start
+## Mandatory Git preflight once per OS boot
 
-Every `stream-master.service` start performs a blocking GitHub check **before** `master.py` is loaded. The default is three attempts with a 15-second fetch timeout and 5 seconds between attempts. If a newer fast-forward commit exists it is pulled and validated first. If GitHub remains unavailable, the service deliberately starts the last known-good local checkout so an Internet outage cannot disable the installation.
+The first `stream-master.service` start of each **OS boot** performs a blocking GitHub check before `master.py` is loaded. The default is three attempts with a 15-second fetch timeout and 5 seconds between attempts. The kernel boot ID is recorded, so a controller crash/restart during the same boot does not create a repeated GitHub request storm. If a newer fast-forward commit exists it is pulled and validated first. If GitHub remains unavailable, the service starts the last known-good local checkout; the normal Git timer retries later.

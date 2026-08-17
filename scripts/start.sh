@@ -9,7 +9,7 @@ QUALITY="${2:-max480}"
 CONNECTOR="${3:-HDMI-A-1}"
 COOKIE_FILE="${4:-}"
 
-WORKDIR="/tmp/stream-master"
+WORKDIR="${STREAM_MASTER_WORKDIR:-/tmp/stream-master}"
 SUPERVISOR="$WORKDIR/supervisor.sh"
 PIDFILE="$WORKDIR/stream.pid"
 LOGFILE="$WORKDIR/stream.log"
@@ -82,7 +82,13 @@ STABLE_SECONDS=180
 QUICK_FAIL_SECONDS=120
 QUICK_FAIL_LIMIT=10
 COOLDOWN_SECONDS=300
+MAX_CHRONIC_COOLDOWN=3600
 YOUTUBE_LOGIN_COOLDOWN=600
+MAX_YOUTUBE_COOLDOWN=3600
+MAX_LOG_BYTES=1048576
+MAX_ATTEMPT_LOG_BYTES=262144
+MONITOR_INTERVAL=10
+LAST_STATE_SIG=''
 STOP=0
 CHILD=''
 MONITOR=''
@@ -94,6 +100,52 @@ CURRENT_HEALTH='connecting'
 CURRENT_REASON='starting Streamlink'
 
 clean_value(){ printf '%s' "$1" | tr '\r\n' '  ' | cut -c1-350; }
+cap_file(){
+    file="$1"; max="$2"
+    [ -f "$file" ] || return 0
+    size="$(wc -c < "$file" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    if [ "$size" -gt "$max" ]; then
+        tmp="$file.cap.$$"
+        tail -c "$max" "$file" > "$tmp" 2>/dev/null || return 0
+        # Keep the same inode while Streamlink/tee has the file open. Replacing
+        # the pathname would make tee continue writing to an unlinked old inode.
+        cat "$tmp" > "$file" 2>/dev/null || true
+        rm -f "$tmp"
+    fi
+}
+jitter_seconds(){
+    base="$1"
+    spread=$((base / 10))
+    [ "$spread" -ge 1 ] || { printf '%s' "$base"; return; }
+    delta=$((RANDOM % (spread * 2 + 1) - spread))
+    value=$((base + delta))
+    [ "$value" -ge 1 ] || value=1
+    printf '%s' "$value"
+}
+chronic_cooldown(){
+    # Repeated batches of quick failures back off much more aggressively. A
+    # genuinely stable run resets the level, so a webcam can recover unattended
+    # without a dead source hammering its provider for days.
+    batches="$1"
+    case "$batches" in
+        0|1) base=$COOLDOWN_SECONDS ;;
+        2) base=900 ;;
+        3) base=1800 ;;
+        *) base=$MAX_CHRONIC_COOLDOWN ;;
+    esac
+    jitter_seconds "$base"
+}
+youtube_cooldown(){
+    blocks="$1"
+    case "$blocks" in
+        0|1) base=$YOUTUBE_LOGIN_COOLDOWN ;;
+        2) base=1200 ;;
+        3) base=1800 ;;
+        *) base=$MAX_YOUTUBE_COOLDOWN ;;
+    esac
+    jitter_seconds "$base"
+}
 owns_state(){
     [ ! -r "$STATEFILE" ] && return 0
     current="$(grep '^RUN_ID=' "$STATEFILE" 2>/dev/null | tail -n 1 || true)"
@@ -103,6 +155,9 @@ owns_state(){
 write_state(){
     owns_state || return 0
     health="$1"; reason="$2"; retry_in="${3:-0}"
+    sig="$health|$reason|$retry_in|$SOURCE_NAME|$SELECTED_STREAM|$LAST_ERROR|$LAST_RC|$YOUTUBE_COOKIES"
+    [ "$sig" = "$LAST_STATE_SIG" ] && return 0
+    LAST_STATE_SIG="$sig"
     tmp="$STATEFILE.tmp.$$"
     {
         printf 'RUN_ID=%s\n' "$(clean_value "$RUN_ID")"
@@ -144,6 +199,11 @@ classify_attempt(){
         CURRENT_HEALTH='youtube_login_required'; CURRENT_REASON='YouTube requires sign-in / bot verification'; LAST_ERROR='youtube_login_required'
     elif [ "$waiting_line" -gt 0 ]; then
         CURRENT_HEALTH='waiting'; CURRENT_REASON='stream temporarily unavailable; Streamlink is retrying'; LAST_ERROR='none'
+    elif [ "$CURRENT_HEALTH" = live ]; then
+        # The bounded attempt log may eventually rotate away the original
+        # 'Starting player' line. Preserve an already-confirmed live state until
+        # a newer explicit failure/waiting signal is observed.
+        CURRENT_HEALTH='live'; CURRENT_REASON='stream opened and player started'; LAST_ERROR='none'
     elif printf '%s\n' "$text" | grep -Eqi '403([^0-9]|$)|Forbidden'; then
         CURRENT_HEALTH='http_403'; CURRENT_REASON='source returned HTTP 403 / Forbidden'; LAST_ERROR='http_403'
     elif printf '%s\n' "$text" | grep -Eqi '404([^0-9]|$)|Not Found'; then
@@ -163,7 +223,7 @@ classify_attempt(){
     write_state "$CURRENT_HEALTH" "$CURRENT_REASON" 0
 }
 
-monitor_attempt(){ while [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; do classify_attempt; sleep 2; done; }
+monitor_attempt(){ while [ -n "$CHILD" ] && kill -0 "$CHILD" 2>/dev/null; do classify_attempt; cap_file "$LOGFILE" "$MAX_LOG_BYTES"; cap_file "$ATTEMPT_LOG" "$MAX_ATTEMPT_LOG_BYTES"; sleep "$MONITOR_INTERVAL"; done; }
 stop_supervisor(){
     STOP=1
     [ -n "$MONITOR" ] && kill -TERM "$MONITOR" 2>/dev/null || true
@@ -173,6 +233,8 @@ trap stop_supervisor TERM INT HUP
 
 backoff=$MIN_BACKOFF
 quick_failures=0
+failure_batches=0
+youtube_blocks=0
 write_state 'starting' 'supervisor started' 0
 
 while [ "$STOP" -eq 0 ]; do
@@ -183,7 +245,7 @@ while [ "$STOP" -eq 0 ]; do
     {
         echo "===== attempt $(date -Is 2>/dev/null || date) ====="
         echo "run_id=$RUN_ID url=$URL selector=$STREAM_SELECTOR policy=$QUALITY_POLICY connector=$CONNECTOR source_hint=$SOURCE_HINT"
-        echo "backoff=${backoff}s quick_failures=$quick_failures youtube_cookies=$YOUTUBE_COOKIES"
+        echo "backoff=${backoff}s quick_failures=$quick_failures failure_batches=$failure_batches youtube_blocks=$youtube_blocks youtube_cookies=$YOUTUBE_COOKIES"
     } >> "$LOGFILE"
 
     CMD=(
@@ -217,9 +279,11 @@ while [ "$STOP" -eq 0 ]; do
     # HLS error. Frequent restarts only send more rejected requests.
     # Pause this source for ten minutes, then try from a clean outer state.
     if [ "$CURRENT_HEALTH" = youtube_login_required ]; then
-        write_state 'youtube_login_required' "YouTube requires sign-in / bot verification; retrying in ${YOUTUBE_LOGIN_COOLDOWN}s" "$YOUTUBE_LOGIN_COOLDOWN"
-        echo "YouTube login/bot verification requested; waiting ${YOUTUBE_LOGIN_COOLDOWN}s before retry." >> "$LOGFILE"
-        sleep "$YOUTUBE_LOGIN_COOLDOWN" & wait $! || true
+        youtube_blocks=$((youtube_blocks + 1))
+        delay="$(youtube_cooldown "$youtube_blocks")"
+        write_state 'youtube_login_required' "YouTube requires sign-in / bot verification; retrying in ${delay}s" "$delay"
+        echo "YouTube login/bot verification requested; block level=$youtube_blocks, waiting ${delay}s (jittered) before retry." >> "$LOGFILE"
+        sleep "$delay" & wait $! || true
         quick_failures=0
         backoff=$MIN_BACKOFF
         continue
@@ -230,23 +294,28 @@ while [ "$STOP" -eq 0 ]; do
     fi
 
     if [ "$runtime" -ge "$STABLE_SECONDS" ]; then
-        quick_failures=0; backoff=$MIN_BACKOFF
+        quick_failures=0; backoff=$MIN_BACKOFF; failure_batches=0; youtube_blocks=0
         echo 'Stable run; restart penalty reset.' >> "$LOGFILE"
     elif [ "$runtime" -lt "$QUICK_FAIL_SECONDS" ]; then
         quick_failures=$((quick_failures + 1))
     fi
 
     if [ "$quick_failures" -ge "$QUICK_FAIL_LIMIT" ]; then
-        write_state 'cooldown' "too many quick failures; last error: $CURRENT_REASON" "$COOLDOWN_SECONDS"
-        echo "Too many quick failures; cooling down ${COOLDOWN_SECONDS}s." >> "$LOGFILE"
-        sleep "$COOLDOWN_SECONDS" & wait $! || true
+        failure_batches=$((failure_batches + 1))
+        delay="$(chronic_cooldown "$failure_batches")"
+        write_state 'cooldown' "too many quick failures; last error: $CURRENT_REASON" "$delay"
+        echo "Too many quick failures; chronic level=$failure_batches, cooling down ${delay}s (jittered)." >> "$LOGFILE"
+        sleep "$delay" & wait $! || true
         quick_failures=0; backoff=$MIN_BACKOFF
         continue
     fi
 
-    write_state 'retrying' "$CURRENT_REASON; retrying in ${backoff}s" "$backoff"
-    echo "Restarting in ${backoff}s." >> "$LOGFILE"
-    sleep "$backoff" & wait $! || true
+    delay="$(jitter_seconds "$backoff")"
+    write_state 'retrying' "$CURRENT_REASON; retrying in ${delay}s" "$delay"
+    echo "Restarting in ${delay}s (base ${backoff}s, jittered)." >> "$LOGFILE"
+    cap_file "$LOGFILE" "$MAX_LOG_BYTES"
+    cap_file "$ATTEMPT_LOG" "$MAX_ATTEMPT_LOG_BYTES"
+    sleep "$delay" & wait $! || true
     if [ "$backoff" -lt "$MAX_BACKOFF" ]; then
         backoff=$((backoff + BACKOFF_STEP)); [ "$backoff" -le "$MAX_BACKOFF" ] || backoff=$MAX_BACKOFF
     fi
@@ -291,7 +360,7 @@ find_matching_pids(){
         pid="${proc##*/}"; [ "$pid" = "$$" ] && continue
         cmd="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
         case "$cmd" in
-            *"$WORKDIR/supervisor.sh"*|*/bin/streamlink\ *|*/streamlink/bin/python\ *|*/bin/cvlc\ *) printf '%s\n' "$pid" ;;
+            */stream-master/supervisor.sh*|*/bin/streamlink\ *|*/streamlink/bin/python\ *|*/bin/cvlc\ *) printf '%s\n' "$pid" ;;
         esac
     done
 }

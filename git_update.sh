@@ -7,11 +7,25 @@ REMOTE="${STREAM_MASTER_GIT_REMOTE:-origin}"
 BRANCH="${STREAM_MASTER_GIT_BRANCH:-}"
 FETCH_TIMEOUT="${STREAM_MASTER_GIT_FETCH_TIMEOUT:-30}"
 RUNTIME="$DIR/runtime"
-BOOT_MODE=0
-[ "${1:-}" = "--boot" ] && BOOT_MODE=1
 mkdir -p "$RUNTIME"
+chmod 700 "$RUNTIME" 2>/dev/null || true
 
 log(){ printf '[git-update] %s\n' "$*"; }
+
+BOOT_MODE=0
+if [ "${1:-}" = "--boot" ]; then
+    BOOT_MODE=1
+fi
+
+# Cross-process maintenance lock. The root systemd wrapper may already own it;
+# direct/boot invocations acquire it here.
+if [ "${STREAM_MASTER_MAINTENANCE_LOCK_HELD:-0}" != 1 ]; then
+    exec 9>>"$RUNTIME/maintenance.lock"
+    if ! flock -n 9; then
+        log "Andere Wartung läuft – Git-Update später erneut versuchen."
+        exit 0
+    fi
+fi
 
 # nodes.json is installation state, never deployable code. Refuse to run if the
 # current checkout tracks it. This is stricter than .gitignore and prevents an
@@ -44,34 +58,33 @@ if [ -z "$BRANCH" ]; then
     [ -n "$BRANCH" ] || BRANCH=main
 fi
 
-# Never replace code while node maintenance/reboot jobs are active. During the
-# boot-time preflight there is no running master yet, so stale runtime "running"
-# flags from a hard power-off are ignored. A real recovery guard is never ignored.
+# Never replace code while node maintenance/reboot jobs are active. Persisted
+# maintenance state is treated conservatively at boot as well; a real recovery
+# or final master power-job resume takes precedence over deploying new code.
 if [ -f "$RUNTIME/update_guard.json" ]; then
     log "Update-Wiederherstellung ist offen – Git-Update bis zur sicheren Recovery ausgesetzt."
     exit 0
 fi
-if [ "$BOOT_MODE" -eq 0 ]; then
-    if ! /usr/bin/python3 - "$RUNTIME" <<'PY'
+if ! /usr/bin/python3 - "$RUNTIME" "$BOOT_MODE" <<'PY'
 import json, pathlib, sys
 r=pathlib.Path(sys.argv[1])
+boot_mode = sys.argv[2] == '1'
 def read(name, default):
     try: return json.loads((r/name).read_text())
     except Exception: return default
 u=read('update_ui_state.json', {})
-if isinstance(u, dict) and u.get('running'):
-    raise SystemExit(1)
+if isinstance(u, dict) and u.get('running'): raise SystemExit(1)
 j=read('node_jobs.json', {})
-if isinstance(j, dict) and any(isinstance(v, dict) and v.get('running') for v in j.values()):
-    raise SystemExit(1)
+if isinstance(j, dict) and any(isinstance(v, dict) and v.get('running') for v in j.values()): raise SystemExit(1)
 f=read('fleet_job.json', {})
-if isinstance(f, dict) and f.get('running'):
-    raise SystemExit(1)
+if isinstance(f, dict) and f.get('running'): raise SystemExit(1)
+if not boot_mode:
+    s=read('startup_autostart.json', {})
+    if isinstance(s, dict) and s.get('running'): raise SystemExit(1)
 PY
-    then
-        log "Master ist mit Start/Reboot/Update beschäftigt – Git-Update später erneut versuchen."
-        exit 0
-    fi
+then
+    log "Master ist mit Startphase/Reboot/Update/Wiederherstellung beschäftigt – Git-Update später erneut versuchen."
+    exit 0
 fi
 
 # Tracked local edits are not discarded. This protects emergency changes made on site.
@@ -92,11 +105,23 @@ export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o StrictHostKey
 
 OLD="$(git -C "$DIR" rev-parse HEAD)"
 log "Prüfe $REMOTE/$BRANCH …"
-if ! timeout "${FETCH_TIMEOUT}s" git -C "$DIR" fetch --quiet "$REMOTE" "refs/heads/$BRANCH:refs/remotes/$REMOTE/$BRANCH"; then
-    log "GitHub nicht erreichbar oder Fetch fehlgeschlagen – alter, funktionierender Stand bleibt aktiv."
+# ls-remote is read-only and avoids rewriting .git/FETCH_HEAD every five minutes
+# when production is already current. Only a changed SHA triggers a real fetch.
+REMOTE_SHA="$(timeout "${FETCH_TIMEOUT}s" git -C "$DIR" ls-remote "$REMOTE" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1 {print $1}')"
+if [ -z "$REMOTE_SHA" ]; then
+    log "GitHub nicht erreichbar oder Branch fehlt – alter, funktionierender Stand bleibt aktiv."
     exit 4
 fi
-REMOTE_SHA="$(git -C "$DIR" rev-parse "$REMOTE/$BRANCH")"
+if [ "$OLD" = "$REMOTE_SHA" ]; then
+    log "Bereits aktuell ($OLD)."
+    exit 0
+fi
+if ! timeout "${FETCH_TIMEOUT}s" git -C "$DIR" fetch --quiet "$REMOTE" "refs/heads/$BRANCH:refs/remotes/$REMOTE/$BRANCH"; then
+    log "GitHub erreichbar, aber Fetch fehlgeschlagen – alter Stand bleibt aktiv."
+    exit 4
+fi
+FETCHED_SHA="$(git -C "$DIR" rev-parse "$REMOTE/$BRANCH")"
+[ "$FETCHED_SHA" = "$REMOTE_SHA" ] || { log "Remote-SHA änderte sich während des Fetch; später erneut versuchen."; exit 4; }
 
 # Also reject a remote commit which tries to introduce nodes.json. The automatic
 # updater must never create, merge, replace or delete the local nodes.json.
@@ -107,11 +132,6 @@ fi
 if git -C "$DIR" cat-file -e "$REMOTE_SHA:youtube-cookies.txt" 2>/dev/null; then
     log "SICHERHEITSSTOPP: Remote-Commit enthält youtube-cookies.txt. Code-Update verweigert; Cookies dürfen nicht ins öffentliche Repository."
     exit 11
-fi
-
-if [ "$OLD" = "$REMOTE_SHA" ]; then
-    log "Bereits aktuell ($OLD)."
-    exit 0
 fi
 
 # Refuse force-push/diverged histories on the installation machine.
@@ -127,10 +147,11 @@ NEW="$(git -C "$DIR" rev-parse HEAD)"
 # running master. Since the tree was clean before the fast-forward, a rollback
 # to OLD is safe and does not touch ignored local nodes.json/runtime state.
 validate_new_code() {
-    [ -f "$DIR/master.py" ] && [ -f "$DIR/update_pis.py" ] || return 1
+    [ -f "$DIR/master.py" ] && [ -f "$DIR/update_pis.py" ] && [ -f "$DIR/selftest.py" ] || return 1
     [ -f "$DIR/web/index.html" ] && [ -f "$DIR/web/app.js" ] && [ -f "$DIR/web/style.css" ] || return 1
-    /usr/bin/python3 -m py_compile "$DIR/master.py" "$DIR/update_pis.py" || return 1
-    for f in "$DIR"/scripts/*.sh "$DIR"/run_master.sh "$DIR"/git_update.sh "$DIR"/git_update_systemd.sh "$DIR"/prepare_master_writable.sh "$DIR"/update_master_local.sh "$DIR"/local_stream_service.sh; do
+    /usr/bin/python3 -m py_compile "$DIR/master.py" "$DIR/update_pis.py" "$DIR/selftest.py" || return 1
+    /usr/bin/python3 "$DIR/selftest.py" || return 1
+    for f in "$DIR"/scripts/*.sh "$DIR"/run_master.sh "$DIR"/git_update.sh "$DIR"/git_update_systemd.sh "$DIR"/prepare_master_writable.sh "$DIR"/update_master_local.sh "$DIR"/local_stream_service.sh "$DIR"/backup_local_state.sh; do
         [ -f "$f" ] || return 1
         /bin/bash -n "$f" || return 1
     done

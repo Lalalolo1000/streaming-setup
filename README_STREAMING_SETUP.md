@@ -31,7 +31,7 @@ Der Controller verwendet nur Passwort-Authentifizierung und ignoriert SSH-Host-K
 
 ## YouTube LOGIN_REQUIRED / Cookies
 
-Optional kann auf dem Master im Projektordner `youtube-cookies.txt` (Netscape-Format) liegen. Die Datei ist Git-ignoriert und wird bei jedem YouTube-Start temporär nach `/tmp/stream-master/youtube-cookies.txt` auf den Ziel-Pi übertragen. `LOGIN_REQUIRED` bekommt eine 10-Minuten-Pause statt schneller Endlosschleifen. Stop/Restart beendet die komplette Prozessgruppe aus Supervisor, Streamlink, VLC und Hilfsprozessen.
+Optional kann auf dem Master im Projektordner `youtube-cookies.txt` (Netscape-Format) liegen. Die Datei ist Git-ignoriert und wird bei jedem YouTube-Start temporär nach `/tmp/stream-master/youtube-cookies.txt` auf den Ziel-Pi übertragen. `LOGIN_REQUIRED` beginnt mit einer ungefähr 10-minütigen Pause; bei wiederholten schnellen Bot/Login-Fehlern wächst der Cooldown stufenweise bis ungefähr 60 Minuten. Ein stabiler Lauf setzt die Strafe wieder zurück. Stop/Restart beendet die komplette Prozessgruppe aus Supervisor, Streamlink, VLC und Hilfsprozessen.
 
 ## Recovery after an unexpected worker reboot
 

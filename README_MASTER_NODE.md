@@ -56,13 +56,19 @@ wait until shutdown jobs finish
 master (.101) powers off last
 ```
 
-On the next physical power-on, the once-per-boot startup pass starts every configured stream again.
+On the next physical power-on, the master service starts every configured stream again after its boot-settle delay. Any later master-service restart deliberately performs the same staggered Start/Restart pass.
 
 ## Updates
 
 `Update all` treats the master differently:
 
-- Workers: OverlayFS off → reboot → VLC/Streamlink → OverlayFS on → reboot → verify.
-- Master: local VLC/Streamlink update only; no OverlayFS changes and no reboot.
+- Workers: OverlayFS off → reboot → VLC/Streamlink → OverlayFS on → reboot → verify. If protection cannot be restored, the fleet update stops immediately and keeps the recovery guard.
+- Master: stop Stream 01 → locally update VLC/Streamlink → restore Stream 01; no OverlayFS changes and no reboot.
+- Update maintenance preserves the persisted desired running/stopped state; intentionally stopped streams are not started just because packages were updated.
 
 Git code updates are separate and continue to be handled by `git_update.sh` / the systemd timer.
+
+
+## Runtime wear on the writable master
+
+The high-churn Stream 01 runtime (`stream.log`, `status.env`, PID files) is placed under `/dev/shm/stream-master` so normal stream supervision does not continuously write those files to the master's persistent root filesystem. Persistent configuration, Git checkout and recovery/job state remain on disk because they must survive reboots.

@@ -10,14 +10,15 @@ if [ ! -s "$PASSFILE" ]; then
 fi
 cd "$DIR"
 
-# Mandatory boot/service-start Git preflight.
-#
-# The controller does not start until this check has completed. If GitHub is
-# reachable, the checkout is fast-forwarded and validated before Python loads.
-# Network/GitHub failure is deliberately not fatal: after a small number of
-# bounded attempts we start the last known-good local checkout instead of
-# turning an Internet outage into a dead installation.
-if [ -d "$DIR/.git" ] && [ "${STREAM_MASTER_GIT_BOOT_UPDATE:-1}" = 1 ]; then
+# Mandatory Git preflight once per OS boot. Periodic Git checks continue via
+# the timer. Recording the kernel boot ID prevents a crashing controller from
+# doing three network fetch attempts on every systemd restart.
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+BOOT_MARKER="$DIR/runtime/git_preflight_boot_id"
+mkdir -p "$DIR/runtime"
+chmod 700 "$DIR/runtime" 2>/dev/null || true
+LAST_BOOT_ID="$(cat "$BOOT_MARKER" 2>/dev/null || true)"
+if [ -d "$DIR/.git" ] && [ "${STREAM_MASTER_GIT_BOOT_UPDATE:-1}" = 1 ] && [ "$LAST_BOOT_ID" != "$BOOT_ID" ]; then
     BOOT_ATTEMPTS="${STREAM_MASTER_GIT_BOOT_ATTEMPTS:-3}"
     BOOT_RETRY_DELAY="${STREAM_MASTER_GIT_BOOT_RETRY_DELAY:-5}"
     BOOT_FETCH_TIMEOUT="${STREAM_MASTER_GIT_BOOT_FETCH_TIMEOUT:-15}"
@@ -42,8 +43,15 @@ if [ -d "$DIR/.git" ] && [ "${STREAM_MASTER_GIT_BOOT_UPDATE:-1}" = 1 ]; then
     if [ "$GIT_OK" -ne 1 ]; then
         echo "[boot] GitHub preflight could not complete; starting the last known-good local code." >&2
     fi
+    # Mark the check as attempted even when GitHub was unavailable. This is
+    # intentionally once-per-OS-boot; the regular timer will retry later.
+    printf '%s\n' "$BOOT_ID" > "$BOOT_MARKER"
 else
-    echo "[boot] No Git checkout (or boot Git disabled); starting local code."
+    if [ "$LAST_BOOT_ID" = "$BOOT_ID" ]; then
+        echo "[boot] Git preflight already attempted this OS boot; starting local code."
+    else
+        echo "[boot] No Git checkout (or boot Git disabled); starting local code."
+    fi
 fi
 
 # If a periodic Git update requested this service restart, reaching this point

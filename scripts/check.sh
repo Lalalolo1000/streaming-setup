@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fast machine-readable health check used by the web UI.
 set -u
-WORKDIR="/tmp/stream-master"
+WORKDIR="${STREAM_MASTER_WORKDIR:-/tmp/stream-master}"
 PIDFILE="$WORKDIR/stream.pid"
 STATEFILE="$WORKDIR/status.env"
 INFOFILE="/var/lib/stream-master/update-info"
