@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import os
 import json
 import mimetypes
@@ -37,8 +36,10 @@ UPDATE_GUARD_FILE = RUNTIME_DIR / "update_guard.json"
 NODE_JOBS_FILE = RUNTIME_DIR / "node_jobs.json"
 FLEET_JOB_FILE = RUNTIME_DIR / "fleet_job.json"
 STARTUP_STATE_FILE = RUNTIME_DIR / "startup_autostart.json"
-STARTUP_BOOT_ID_FILE = RUNTIME_DIR / "startup_boot_id"
 SSH_PASSWORD_FILE = Path.home() / ".config" / "stream-master" / "ssh-password"
+YOUTUBE_COOKIE_FILE = APP_DIR / "youtube-cookies.txt"
+REMOTE_YOUTUBE_COOKIE_FILE = "/tmp/stream-master/youtube-cookies.txt"
+YOUTUBE_COOKIE_MAX_BYTES = 2 * 1024 * 1024
 MASTER_IP = os.environ.get("STREAM_MASTER_MASTER_IP", "192.168.0.101")
 
 SSH_CONNECT_TIMEOUT = 6
@@ -47,8 +48,8 @@ REBOOT_UP_TIMEOUT = 300
 UPDATE_PROCESS_INACTIVITY_TIMEOUT = 1300
 UPDATE_RECOVERY_GRACE = 720
 STARTUP_AUTOSTART_TIMEOUT = int(os.environ.get("STREAM_MASTER_AUTOSTART_TIMEOUT", "900"))
-STARTUP_AUTOSTART_RETRY = int(os.environ.get("STREAM_MASTER_AUTOSTART_RETRY", "15"))
-STARTUP_AUTOSTART_WORKERS = int(os.environ.get("STREAM_MASTER_AUTOSTART_WORKERS", "8"))
+STARTUP_AUTOSTART_RETRY = int(os.environ.get("STREAM_MASTER_AUTOSTART_RETRY", "30"))
+STARTUP_AUTOSTART_STAGGER = float(os.environ.get("STREAM_MASTER_AUTOSTART_STAGGER", "5"))
 
 SCRIPT_ACTIONS = {"start", "check", "logs", "kill", "reboot", "shutdown"}
 NORMAL_ACTIONS = {"start", "check", "logs", "kill"}
@@ -335,6 +336,7 @@ def ssh_base(node: dict) -> list[str]:
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "UpdateHostKeys=no",
+        "-o", "LogLevel=ERROR",
         "-o", "PreferredAuthentications=password",
         "-o", "PubkeyAuthentication=no",
         "-o", "PasswordAuthentication=yes",
@@ -394,7 +396,7 @@ def _run_local_script_unlocked(node: dict, action: str) -> tuple[int, str, str |
     if action == "start":
         if not str(node.get("url", "")).strip():
             return 2, "Kein Stream-Link konfiguriert.", "remote_command_failed"
-        args = [str(node.get("url", "")), str(node.get("quality", "max480")), str(node.get("connector", "HDMI-A-1"))]
+        args = [str(node.get("url", "")), str(node.get("quality", "max480")), str(node.get("connector", "HDMI-A-1")), str(YOUTUBE_COOKIE_FILE)]
     command = ["bash", "-s", "--", *args]
     timeout = 30 if action == "start" else 20
     name = str(node.get("name") or node_key(node))
@@ -431,11 +433,37 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
         return _run_local_script_unlocked(node, action)
     script_path = SCRIPTS_DIR / f"{action}.sh"
     script = script_path.read_bytes()
+    payload = script
     args: list[str] = []
     if action == "start":
-        if not str(node.get("url", "")).strip():
+        url = str(node.get("url", "")).strip()
+        if not url:
             return 2, "Kein Stream-Link konfiguriert.", "remote_command_failed"
-        args = [str(node.get("url", "")), str(node.get("quality", "max480")), str(node.get("connector", "HDMI-A-1"))]
+        args = [url, str(node.get("quality", "max480")), str(node.get("connector", "HDMI-A-1")), REMOTE_YOUTUBE_COOKIE_FILE]
+
+        # youtube-cookies.txt is a LOCAL, Git-ignored secret on the master. For
+        # YouTube starts it is prepended to the same SSH stdin payload as start.sh
+        # and written only to /tmp on the worker. This works with OverlayFS, does
+        # not require SCP, and never puts cookie contents in command-line args.
+        is_youtube = bool(re.search(r"(?:youtube\.com|youtu\.be)/", url, re.I))
+        prelude = bytearray(b"umask 077\nmkdir -p /tmp/stream-master\n")
+        if is_youtube and YOUTUBE_COOKIE_FILE.is_file():
+            cookie = YOUTUBE_COOKIE_FILE.read_bytes()
+            if len(cookie) > YOUTUBE_COOKIE_MAX_BYTES:
+                return 2, f"youtube-cookies.txt ist größer als {YOUTUBE_COOKIE_MAX_BYTES} Bytes.", "remote_command_failed"
+            marker = f"__STREAMING_SETUP_COOKIE_{os.getpid()}_{time.time_ns()}__"
+            while marker.encode() in cookie:
+                marker += "X"
+            prelude.extend(f"cat > {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)} <<'{marker}'\n".encode())
+            prelude.extend(cookie)
+            if cookie and not cookie.endswith(b"\n"):
+                prelude.extend(b"\n")
+            prelude.extend(f"{marker}\nchmod 600 {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)}\n".encode())
+        else:
+            # Remove a cookie from a previous YouTube configuration if the local
+            # secret was deleted or this node is now assigned a different source.
+            prelude.extend(f"rm -f {shlex.quote(REMOTE_YOUTUBE_COOKIE_FILE)}\n".encode())
+        payload = bytes(prelude) + script
     remote = "bash -s --" + (" " + " ".join(shlex.quote(x) for x in args) if args else "")
     command = ssh_base(node) + [remote]
     timeout = 30 if action == "start" else 20
@@ -444,7 +472,7 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
     try:
         done = subprocess.run(
             command,
-            input=script,
+            input=payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -464,26 +492,52 @@ def _run_script_unlocked(node: dict, action: str) -> tuple[int, str, str | None]
         return 124, output.strip(), "node_unreachable"
 
 
-def run_script(node: dict, action: str) -> tuple[int, str, str | None]:
+def _run_script_guarded(node: dict, action: str, *, wait_for_lock: float = 0.0) -> tuple[int, str, str | None]:
+    """Run one node action while serializing short master-side commands.
+
+    Normal UI actions stay non-blocking and return NodeBusy if another command
+    is already in flight. Config application is different: changing a stream URL
+    must win over a background status check/start request, so it may wait briefly
+    for this lock and then replace the watcher with the freshly saved config.
+    Long-lived reboot/shutdown/update/fleet jobs are still never interrupted.
+    """
     with UPDATE_LOCK:
         if UPDATE_STATE["running"]:
             raise RuntimeError("software update is currently running")
     if fleet_running():
         raise RuntimeError("fleet power operation is currently running")
-    if active_node_job_for(node_key(node)):
+    target = node_key(node)
+    if active_node_job_for(target):
         raise NodeBusy("node operation already in progress")
     lock = node_lock(node)
-    if not lock.acquire(blocking=False):
+    acquired = lock.acquire(timeout=max(0.0, wait_for_lock)) if wait_for_lock > 0 else lock.acquire(blocking=False)
+    if not acquired:
         raise NodeBusy("node is busy")
     try:
-        # Re-check after taking the node lock. This closes the small race where
-        # an update starts while an already-requested check/start was waiting.
+        # Re-check everything after taking the node lock. A reboot/update may
+        # have started while a config-save request was waiting for a status check.
         with UPDATE_LOCK:
             if UPDATE_STATE["running"]:
                 raise RuntimeError("software update is currently running")
+        if fleet_running():
+            raise RuntimeError("fleet power operation is currently running")
+        if active_node_job_for(target):
+            raise NodeBusy("node operation already in progress")
         return _run_script_unlocked(node, action)
     finally:
         lock.release()
+
+
+def run_script(node: dict, action: str) -> tuple[int, str, str | None]:
+    return _run_script_guarded(node, action, wait_for_lock=0.0)
+
+
+def run_script_after_config_change(node: dict, action: str) -> tuple[int, str, str | None]:
+    # A status check or an already-issued Start request can occupy the per-node
+    # lock for a few seconds. URL edits should not fail with "node busy" because
+    # of that. Wait long enough for the current SSH command to finish, then run
+    # start.sh, which kills/replaces the old supervisor + Streamlink + VLC group.
+    return _run_script_guarded(node, action, wait_for_lock=45.0)
 
 
 def parse_machine_output(output: str) -> dict[str, str]:
@@ -787,7 +841,7 @@ def save_node_config(index: int | None, value: object, apply: bool = False) -> d
         if apply and runtime_changed:
             if target_changed and old is not None:
                 try:
-                    old_code, old_output, _ = run_script(old, "kill")
+                    old_code, old_output, _ = run_script_after_config_change(old, "kill")
                     if old_code != 0:
                         old_stop_warning = old_output or "old target could not be stopped"
                 except Exception as exc:
@@ -796,9 +850,9 @@ def save_node_config(index: int | None, value: object, apply: bool = False) -> d
                 # Clearing a URL means "no stream configured". Stop the current
                 # stream on the still-selected target instead of trying to start
                 # an empty URL.
-                code, output, failure = run_script(node, "kill")
+                code, output, failure = run_script_after_config_change(node, "kill")
             else:
-                code, output, failure = run_script(node, "start")
+                code, output, failure = run_script_after_config_change(node, "start")
             apply_result = {"ok": code == 0, "returncode": code, "output": output, "failure": failure, "old_stop_warning": old_stop_warning}
         return {"ok": True, "index": index, "node": node, "url_changed": url_changed, "target_changed": target_changed, "runtime_changed": runtime_changed, "apply": apply_result}
 
@@ -1054,14 +1108,6 @@ def start_update(*, node_index: int | None = None, all_nodes: bool = False, reco
     return _update_snapshot()
 
 
-def current_boot_id() -> str:
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-    except OSError:
-        # Fallback is intentionally process-independent only when boot_id is unavailable.
-        return "unknown-boot"
-
-
 def _write_startup_state(**changes) -> None:
     state = read_json_file(STARTUP_STATE_FILE, {})
     if not isinstance(state, dict):
@@ -1070,94 +1116,144 @@ def _write_startup_state(**changes) -> None:
     atomic_json_write(STARTUP_STATE_FILE, state)
 
 
-def _autostart_one_node(node: dict, deadline: float) -> dict:
+def _autostart_attempt(node: dict, attempts: int) -> dict:
+    """Try to (re)start one configured stream exactly once.
+
+    Startup orchestration deliberately does not sit on one unavailable node.
+    Unreachable/busy nodes are marked pending and revisited after the first
+    staggered pass across the whole installation.
+    """
     name = str(node.get("name") or node_key(node))
     target = node_key(node)
-    if not str(node.get("url", "")).strip():
-        return {"name": name, "target": target, "result": "skipped_no_url"}
-    attempts = 0
-    last_failure = None
-    last_output = ""
-    while now() < deadline:
-        attempts += 1
-        try:
-            code, output, failure = run_script(node, "start")
-        except (NodeBusy, RuntimeError) as exc:
-            code, output, failure = 1, str(exc), "busy"
-        last_failure, last_output = failure, output
-        if code == 0:
-            return {"name": name, "target": target, "result": "started", "attempts": attempts}
-        # Power-on race: retry nodes that simply are not reachable yet. An auth
-        # or software/configuration error will not become better by hammering it.
-        if failure not in {"node_unreachable", "ssh_failed", "busy"}:
-            break
-        remaining = deadline - now()
-        if remaining <= 0:
-            break
-        time.sleep(min(STARTUP_AUTOSTART_RETRY, max(1, remaining)))
+    try:
+        code, output, failure = run_script(node, "start")
+    except (NodeBusy, RuntimeError) as exc:
+        code, output, failure = 1, str(exc), "busy"
+
+    if code == 0:
+        return {
+            "name": name,
+            "target": target,
+            "result": "started",
+            "attempts": attempts,
+        }
+
+    retryable = failure in {"node_unreachable", "ssh_failed", "busy"}
     return {
         "name": name,
         "target": target,
-        "result": "failed",
+        "result": "pending" if retryable else "failed",
         "attempts": attempts,
-        "failure": last_failure,
-        "output": last_output[-300:],
+        "failure": failure,
+        "output": output[-300:],
     }
 
 
-def startup_autostart_once_per_boot() -> None:
-    """Start every configured stream once after a fresh MASTER boot.
+def _startup_sleep(seconds: float, deadline: float) -> None:
+    remaining = deadline - now()
+    if remaining > 0 and seconds > 0:
+        time.sleep(min(seconds, remaining))
 
-    Git-triggered service restarts during the same OS boot do not restart all
-    video streams. If this worker itself is interrupted before completion, the
-    boot marker is not written, so systemd's next service start retries safely.
+
+def startup_autostart_on_server_start() -> None:
+    """Restart every configured stream whenever the master server starts.
+
+    The first pass is intentionally gentle: the master node is started first,
+    then each configured worker is started five seconds after the previous one
+    by default. This avoids a 24-node burst of SSH, Streamlink and source-site
+    requests. Nodes which are still booting do not block the first pass; they
+    are revisited afterwards until STARTUP_AUTOSTART_TIMEOUT expires.
     """
     if os.environ.get("STREAM_MASTER_AUTOSTART", "1") not in {"1", "yes", "true", "on"}:
         print("Startup autostart disabled by STREAM_MASTER_AUTOSTART.")
         return
-    boot_id = current_boot_id()
-    try:
-        if STARTUP_BOOT_ID_FILE.read_text(encoding="utf-8").strip() == boot_id:
-            print("Startup autostart already completed during this OS boot; skipping.")
-            return
-    except OSError:
-        pass
 
     nodes = read_nodes()
     configured = [n for n in nodes if str(n.get("url", "")).strip()]
+    # Python's sort is stable, so worker order remains the nodes.json order.
+    configured.sort(key=lambda node: 0 if is_master_node(node) else 1)
+
     _write_startup_state(
         running=True,
-        boot_id=boot_id,
+        mode="every_server_start_staggered",
         started_at=now(),
         finished_at=None,
         configured=len(configured),
         total=len(nodes),
+        stagger_seconds=STARTUP_AUTOSTART_STAGGER,
         results=[],
     )
-    print(f"Daily startup: {len(configured)}/{len(nodes)} configured streams; waiting up to {STARTUP_AUTOSTART_TIMEOUT}s for Pis.")
-    deadline = now() + STARTUP_AUTOSTART_TIMEOUT
-    results: list[dict] = []
-    if configured:
-        workers = max(1, min(STARTUP_AUTOSTART_WORKERS, len(configured)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="daily-start") as pool:
-            futures = [pool.submit(_autostart_one_node, node, deadline) for node in configured]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                except Exception as exc:
-                    result = {"result": "failed", "failure": "master_exception", "output": str(exc)}
-                results.append(result)
-                _write_startup_state(results=results)
-                print(f"Daily startup: {result}")
-    # No URL is a valid, intentionally unconfigured node and does not prevent
-    # completion of the once-per-boot marker.
-    _write_startup_state(running=False, finished_at=now(), results=results)
-    STARTUP_BOOT_ID_FILE.write_text(boot_id + "\n", encoding="utf-8")
-    print("Daily startup pass completed for this OS boot.")
+    print(
+        f"Server startup: restarting {len(configured)}/{len(nodes)} configured streams "
+        f"sequentially with {STARTUP_AUTOSTART_STAGGER:g}s spacing; "
+        f"waiting up to {STARTUP_AUTOSTART_TIMEOUT}s for Pis."
+    )
 
+    deadline = now() + STARTUP_AUTOSTART_TIMEOUT
+    results_by_target: dict[str, dict] = {}
+    pending: list[tuple[dict, int]] = []
+
+    # First pass: exactly one attempt per node, spaced out. An offline node is
+    # queued for later instead of delaying every node after it.
+    for pos, node in enumerate(configured):
+        if now() >= deadline:
+            break
+        result = _autostart_attempt(node, 1)
+        target = str(result.get("target") or node_key(node))
+        results_by_target[target] = result
+        if result.get("result") == "pending":
+            pending.append((node, 1))
+        _write_startup_state(results=list(results_by_target.values()))
+        print(f"Server startup: {result}")
+        if pos + 1 < len(configured):
+            _startup_sleep(STARTUP_AUTOSTART_STAGGER, deadline)
+
+    # Retry only Pis which were unreachable/busy. Each retry round starts no
+    # sooner than STARTUP_AUTOSTART_RETRY after the previous pass and still
+    # spaces individual starts, so recovery cannot turn into another burst.
+    round_no = 0
+    while pending and now() < deadline:
+        round_no += 1
+        _startup_sleep(STARTUP_AUTOSTART_RETRY, deadline)
+        if now() >= deadline:
+            break
+        print(f"Server startup: retry round {round_no} for {len(pending)} pending node(s).")
+        next_pending: list[tuple[dict, int]] = []
+        current_pending = pending
+        for pos, (node, attempts) in enumerate(current_pending):
+            if now() >= deadline:
+                next_pending.extend(current_pending[pos:])
+                break
+            result = _autostart_attempt(node, attempts + 1)
+            target = str(result.get("target") or node_key(node))
+            results_by_target[target] = result
+            if result.get("result") == "pending":
+                next_pending.append((node, attempts + 1))
+            _write_startup_state(results=list(results_by_target.values()))
+            print(f"Server startup: {result}")
+            if pos + 1 < len(current_pending):
+                _startup_sleep(STARTUP_AUTOSTART_STAGGER, deadline)
+        pending = next_pending
+
+    # Convert any timed-out pending entries to a final failure state.
+    for node, attempts in pending:
+        target = node_key(node)
+        previous = dict(results_by_target.get(target) or {})
+        previous.update({
+            "name": str(node.get("name") or target),
+            "target": target,
+            "result": "failed",
+            "attempts": attempts,
+            "failure": previous.get("failure") or "startup_timeout",
+        })
+        results_by_target[target] = previous
+
+    results = list(results_by_target.values())
+    _write_startup_state(running=False, finished_at=now(), results=results)
+    print("Server startup stream restart pass completed.")
 
 def launch_startup_autostart() -> None:
-    threading.Thread(target=startup_autostart_once_per_boot, daemon=True, name="daily-autostart").start()
+    threading.Thread(target=startup_autostart_on_server_start, daemon=True, name="startup-autostart").start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1309,8 +1405,8 @@ def main() -> int:
     if update_guard_snapshot():
         print("WARNING: interrupted-update recovery guard exists; open Admin view and recover before another update.")
 
-    # Start the daily node pass in the background so the web UI is available
-    # immediately even while the Pis themselves are still booting.
+    # Restart every configured stream once in the background on each server
+    # start, while keeping the web UI available during Pi boot/retry delays.
     launch_startup_autostart()
 
     def stop_handler(signum, frame):

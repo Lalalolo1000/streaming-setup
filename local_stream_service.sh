@@ -48,4 +48,5 @@ if [ -z "$URL" ]; then
   exit 0
 fi
 
-exec /bin/bash "$DIR/scripts/start.sh" "$URL" "$QUALITY" "$CONNECTOR"
+COOKIE_FILE="$DIR/youtube-cookies.txt"
+exec /bin/bash "$DIR/scripts/start.sh" "$URL" "$QUALITY" "$CONNECTOR" "$COOKIE_FILE"

@@ -79,9 +79,9 @@ Manuell mit denselben Regeln:
 
 ## Täglicher Betrieb
 
-Beim **ersten Master-Start pro echtem Linux-Boot** wird für jeden Pi mit eingetragener URL automatisch `start.sh` gestartet. Der Master wartet dabei auf Pis, die noch hochfahren. Dadurch reicht es im Normalfall, die gesamte Installation morgens einzuschalten.
+Bei **jedem Start des Master-Servers** wird für jeden Pi mit eingetragener URL automatisch `start.sh` gestartet. Die Starts werden absichtlich verteilt: Master zuerst, danach jeweils etwa **5 Sekunden Abstand** zwischen den Nodes. Noch bootende Pis blockieren den ersten Durchlauf nicht und werden danach erneut versucht. Dadurch reicht es im Normalfall, die gesamte Installation morgens einzuschalten.
 
-Ein GitHub-bedingter Neustart des Master-Dienstes am selben Tag führt nicht noch einmal zu `Start all`.
+Auch ein GitHub-bedingter Neustart des Master-Dienstes startet/restartet alle konfigurierten Streams einmal.
 
 ## Automatische GitHub-Codeupdates
 
@@ -140,3 +140,41 @@ It must not print `overlay`.
 - A single-node OverlayFS update of the master is rejected intentionally.
 
 The controller recognizes only one master. Do not mark a second node as `role=master`.
+
+
+## Stream-Verhalten beim Serverstart
+
+Bei **jedem Start des Streaming-Setup-Servers** werden alle Nodes mit konfigurierter URL einmal neu gestartet: `.101` zuerst, danach die übrigen Nodes mit standardmäßig 5 Sekunden Abstand. Noch bootende Pis werden bis zu 15 Minuten in späteren, ebenfalls gedrosselten Runden erneut versucht. Danach übernimmt auf jedem Pi der lokale Stream-Supervisor.
+
+Der Supervisor behandelt vorübergehende Streamlink-Fehler innerhalb eines laufenden Versuchs nicht sofort als endgültigen Quellenfehler. Die äußeren Neustartabstände sind bewusst flach: **5, 10, 15, 20, 25, maximal 30 Sekunden**. Nach vielen schnellen Fehlern folgt eine kurze 60-Sekunden-Pause.
+
+
+## Optional YouTube cookies
+
+If YouTube returns `LOGIN_REQUIRED` / `Sign in to confirm you’re not a bot`, you can place a Netscape-format cookie export directly in the repository folder on the master:
+
+```text
+youtube-cookies.txt
+```
+
+Then protect it locally:
+
+```bash
+chmod 600 youtube-cookies.txt
+```
+
+The file is intentionally listed in `.gitignore` and the automatic Git updater also refuses any local or remote commit which tracks it. **Do not commit this file to the public repository.**
+
+Whenever a YouTube stream is started/restarted, the master sends the cookie file in the same SSH stdin payload as `start.sh` and writes it to the worker only as:
+
+```text
+/tmp/stream-master/youtube-cookies.txt
+```
+
+Workers therefore do not need a permanent secret on their OverlayFS root. The cookie is used only for YouTube URLs. If the local cookie file is removed, the next Start/Restart also deletes the temporary worker copy.
+
+YouTube `LOGIN_REQUIRED` is treated specially: Streamlink performs only a few internal retries spaced 30 seconds apart, and if the bot/login challenge persists the outer watcher waits 10 minutes before trying again. Normal network/HLS/VLC errors use a deliberately slow linear retry schedule of 30, 60, 90, 120, 150 and 180 seconds, capped at 180 seconds. After repeated rapid failures, the watcher pauses for 5 minutes before starting the sequence again.
+
+## Reliable Stop / Restart
+
+Each stream generation now runs in its own process group. Stop/Restart first terminates that complete group, which includes the supervisor, Streamlink, VLC and helper children such as ffmpeg/mux processes. A `/proc` scan remains as compatibility cleanup for older generations. This avoids YouTube-specific child processes surviving a Stop action.

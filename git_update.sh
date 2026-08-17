@@ -20,6 +20,10 @@ if git -C "$DIR" ls-files --error-unmatch nodes.json >/dev/null 2>&1; then
     log "SICHERHEITSSTOPP: nodes.json ist in Git getrackt. Datei aus Git entfernen; lokales nodes.json bleibt unangetastet."
     exit 7
 fi
+if git -C "$DIR" ls-files --error-unmatch youtube-cookies.txt >/dev/null 2>&1; then
+    log "SICHERHEITSSTOPP: youtube-cookies.txt ist in Git getrackt. Cookie-Datei aus Git entfernen; Secret bleibt lokal."
+    exit 10
+fi
 
 if [ ! -d "$DIR/.git" ]; then
     log "Kein Git-Checkout: $DIR – Update übersprungen."
@@ -99,6 +103,10 @@ REMOTE_SHA="$(git -C "$DIR" rev-parse "$REMOTE/$BRANCH")"
 if git -C "$DIR" cat-file -e "$REMOTE_SHA:nodes.json" 2>/dev/null; then
     log "SICHERHEITSSTOPP: Remote-Commit enthält nodes.json. Code-Update verweigert; lokale nodes.json bleibt unverändert."
     exit 8
+fi
+if git -C "$DIR" cat-file -e "$REMOTE_SHA:youtube-cookies.txt" 2>/dev/null; then
+    log "SICHERHEITSSTOPP: Remote-Commit enthält youtube-cookies.txt. Code-Update verweigert; Cookies dürfen nicht ins öffentliche Repository."
+    exit 11
 fi
 
 if [ "$OLD" = "$REMOTE_SHA" ]; then

@@ -127,8 +127,8 @@ EOF_UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now stream-master.service
 sudo systemctl enable --now stream-master-git-update.timer
-# The local-stream unit is intentionally not enabled on its own; the controller's
-# once-per-boot startup pass starts/restarts it using the current nodes.json URL.
+# The local-stream unit is intentionally not enabled on its own; every controller
+# server start reapplies/restarts it using the current local nodes.json URL.
 
 echo
 echo 'Streaming Setup wurde als stream-master.service installiert und gestartet.'

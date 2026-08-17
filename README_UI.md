@@ -46,3 +46,13 @@ Der Projektname selbst bleibt **Streaming Setup**.
 In Admin, Stream 01 / `.101` is marked **MASTER**. Its filesystem status is considered healthy when it is writable. The per-node OverlayFS update button is disabled for the master. `Alle aktualisieren` updates the 23 workers with their normal OverlayFS workflow and updates VLC + Streamlink on the master locally without rebooting it.
 
 Fleet reboot/shutdown always performs the master last so the controller remains available while worker operations are being completed.
+
+## URL changes while a stream is retrying
+
+Saving a changed stream URL always reapplies the runtime configuration. A short
+in-flight status/start SSH command is allowed to finish first; then the old
+watcher/process group is replaced by a fresh `start.sh` generation using the new
+URL. Reboot/shutdown/update operations still block this action intentionally.
+
+The simple overview also exposes retry/wait/cooldown details so unattended
+recovery is visible without opening the Admin view.

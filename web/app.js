@@ -18,7 +18,7 @@ const MASTER_IP='192.168.0.101';
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const isMaster=n=>!!n&&(isMaster(n)||String(n.target||'').endsWith(`@${MASTER_IP}`));
+const isMaster=n=>!!n&&(n.role==='master'||String(n.target||'').endsWith(`@${MASTER_IP}`));
 
 function setNotice(text,kind='',scope='all'){
   const el=$('notice');
@@ -64,6 +64,7 @@ function healthDisplay(raw){
     live:['Live','live'],
     starting:['Startet','warning'],
     connecting:['Verbindet','warning'],
+    waiting:['Wartet auf Stream','warning'],
     retrying:['Neuer Versuch','warning'],
     cooldown:['Wartet','warning'],
     running:['Läuft','warning'],
@@ -74,6 +75,7 @@ function healthDisplay(raw){
     source_unreachable:['Quelle nicht erreichbar','failed'],
     unsupported_url:['URL nicht unterstützt','failed'],
     no_stream:['Kein Stream verfügbar','failed'],
+    youtube_login_required:['YouTube blockiert','failed'],
     player_error:['VLC-Fehler','failed'],
     stream_error:['Stream-Fehler','failed'],
     node_unreachable:['Nicht erreichbar','failed'],
@@ -93,6 +95,7 @@ function reasonDisplay(raw){
     'stream opened and player started':'Stream geöffnet, VLC läuft',
     'opening stream source':'Stream-Quelle wird geöffnet',
     'starting Streamlink':'Streamlink wird gestartet',
+    'configuration saved; restarting stream':'Neue URL gespeichert; Stream wird neu gestartet',
     'supervisor started':'Stream-Wächter gestartet',
     'supervisor stopped':'Stream-Wächter gestoppt',
     'supervisor is not running':'Stream-Wächter läuft nicht',
@@ -103,6 +106,8 @@ function reasonDisplay(raw){
     'could not reach the stream source':'Stream-Quelle konnte nicht erreicht werden',
     'VLC/player failed':'VLC konnte den Stream nicht abspielen',
     'waiting for Streamlink to open the source':'Warte darauf, dass Streamlink die Quelle öffnet',
+    'stream temporarily unavailable; Streamlink is retrying':'Stream vorübergehend nicht verfügbar; Streamlink versucht es weiter',
+    'YouTube requires sign-in / bot verification':'YouTube fordert Anmeldung / Bot-Prüfung',
     'legacy supervisor; press Start once to enable detailed health reporting':'Alter Stream-Wächter aktiv; im Admin einmal neu starten für detaillierten Status',
     'SSH connection failed':'SSH-Verbindung zum Raspberry Pi fehlgeschlagen',
     'SSH authentication failed':'SSH-Anmeldung am Raspberry Pi fehlgeschlagen',
@@ -112,6 +117,7 @@ function reasonDisplay(raw){
     'Node could not be checked':'Raspberry Pi konnte nicht geprüft werden'
   };
   if(exact[text])return exact[text];
+  if(text.startsWith('YouTube requires sign-in / bot verification; retrying in '))return 'YouTube fordert Anmeldung / Bot-Prüfung; neuer Versuch in '+text.split('retrying in ')[1].replace('s',' s');
   if(text.startsWith('Streamlink exited unexpectedly'))return text.replace('Streamlink exited unexpectedly','Streamlink wurde unerwartet beendet');
   if(text.startsWith('too many quick failures; last error:'))return 'Zu viele schnelle Fehlversuche; letzter Fehler: '+reasonDisplay(text.split(':').slice(1).join(':').trim());
   if(text.includes('retrying in '))return reasonDisplay(text.split('; retrying in ')[0])+'; neuer Versuch in '+text.split('; retrying in ')[1].replace('s',' s');
@@ -233,13 +239,15 @@ function render(){
         <span class="source">Quelle: ${esc(n.url?sourceLabel(n.url):'noch nicht konfiguriert')}</span>
       </div>
 
-      <div class="row-actions">
+      <div class="row-actions simple-only">
         <div class="row-actions-main">
-          <button class="button primary" data-node-button type="button" onclick="openEdit(${i},false)">Bearbeiten</button>
+          <button class="button primary" data-node-button type="button" onclick="runOne(${i},'start')">Start</button>
+          <button class="button" data-node-button type="button" onclick="runOne(${i},'kill')">Stop</button>
+          <button class="button secondary" data-node-button type="button" onclick="openEdit(${i},false)">Bearbeiten</button>
         </div>
         <div class="row-actions-power">
-          <button class="button warning" data-node-button type="button" onclick="powerAction(${i},'reboot')">Neu starten</button>
-          <button class="button danger" data-node-button type="button" onclick="powerAction(${i},'shutdown')">Herunterfahren</button>
+          <button class="button warning" data-node-button type="button" onclick="powerAction(${i},'reboot')">Pi-Neustart</button>
+          <button class="button danger" data-node-button type="button" onclick="powerAction(${i},'shutdown')">Aus</button>
         </div>
       </div>
     </div>
@@ -259,6 +267,8 @@ function render(){
         <button class="button" data-node-button type="button" onclick="silentCheck(${i},true)">Jetzt prüfen</button>
         <button class="button" data-node-button type="button" onclick="openEdit(${i},true)">Vollständige Konfiguration</button>
         ${isMaster(n)?'<button class="button" type="button" disabled title="Der Master bleibt schreibbar. Bei „Alle aktualisieren“ werden VLC + Streamlink lokal ohne Reboot aktualisiert.">Master: lokal bei „Alle aktualisieren“</button>':`<button class="button" data-node-button type="button" onclick="startUpdate(${i})">VLC + Streamlink aktualisieren</button>`}
+        <button class="button warning" data-node-button type="button" onclick="powerAction(${i},'reboot')">Pi neu starten</button>
+        <button class="button danger" data-node-button type="button" onclick="powerAction(${i},'shutdown')">Herunterfahren</button>
       </div>
     </div>
   </article>`).join('');
@@ -293,13 +303,20 @@ function applyHealth(i,d){
   const dot=$(`dot-${i}`),status=$(`status-${i}`),detail=$(`detail-${i}`);
   if(dot)dot.className=`dot ${cls}`;
   const card=$(`node-${i}`);
-  if(card){card.classList.remove('state-live','state-warning','state-failed','state-stopped','state-unknown');card.classList.add(`state-${cls}`)}
-  if(status)status.textContent=label;
+  if(card){card.classList.remove('state-live','state-warning','state-failed','state-stopped','state-unknown');card.classList.add(`state-${cls}`);card.dataset.health=String(raw).toLowerCase()}
+  if(status){
+    const retry=d.STREAM_RETRY_IN&&d.STREAM_RETRY_IN!=='0'?` · ${d.STREAM_RETRY_IN} s`:'';
+    status.textContent=['retrying','cooldown','youtube_login_required'].includes(String(raw).toLowerCase())?`${label}${retry}`:label;
+  }
   if(detail){
     const source=d.STREAM_SOURCE&&d.STREAM_SOURCE!=='unknown'?d.STREAM_SOURCE:sourceLabel(nodes[i]?.url||'');
     const quality=d.SELECTED_STREAM&&d.SELECTED_STREAM!=='unknown'?d.SELECTED_STREAM:'';
     const reason=d.STREAM_REASON&&d.STREAM_REASON!=='unknown'?reasonDisplay(d.STREAM_REASON):'';
     let text=raw==='live'?[source,quality].filter(Boolean).join(' · '):[source,reason].filter(Boolean).join(' · ');
+    if(raw==='youtube_login_required'){
+      const cookieState=d.YOUTUBE_COOKIES==='loaded'?'Cookies geladen':d.YOUTUBE_COOKIES==='missing'?'keine Cookies':'Cookie-Status unbekannt';
+      text=[text,cookieState].filter(Boolean).join(' · ');
+    }
     if(d.STREAM_RETRY_IN&&d.STREAM_RETRY_IN!=='0')text+=` · neuer Versuch in ${d.STREAM_RETRY_IN} s`;
     detail.textContent=text||'—';detail.title=detail.textContent;
     const statusBox=detail.closest('.status');if(statusBox)statusBox.title=detail.textContent;
@@ -364,7 +381,7 @@ function updateSummary(){
     if(!job?.running&&d.STATUS==='running')reachableRunning++;
     if(job&&job.running){waiting++;return}
     const h=String(d.STREAM_HEALTH||'unknown').toLowerCase();
-    if(h==='live')live++;else if(['starting','connecting','retrying','cooldown','running'].includes(h))waiting++;else if(h==='stopped')stopped++;else if(h==='unknown')unknown++;else failed++;
+    if(h==='live')live++;else if(['starting','connecting','waiting','retrying','cooldown','running'].includes(h))waiting++;else if(h==='stopped')stopped++;else if(h==='unknown')unknown++;else failed++;
   });
   const parts=[`${reachableRunning}/${nodes.length} aktiv`];
   if(fleetState.running)parts.unshift(fleetState.kind==='reboot'?'Gesamt-Neustart läuft':'Gesamt-Herunterfahren läuft');
@@ -416,11 +433,29 @@ async function runFleet(action){
 
   setNotice('Aktion für alle Raspberry Pis wird gestartet …');
   let failed=0,done=0;
-  await poolIndices(nodes.map((_,i)=>i),4,async i=>{
-    try{const d=await nodeCall(i,action);if(!d.ok)failed++}
-    catch{failed++}
-    finally{done++;setNotice(`Fortschritt: ${done}/${nodes.length}${failed?` · ${failed} fehlgeschlagen`:''}`,failed?'warn':'')}
-  });
+  if(action==='start'){
+    // Start requests are intentionally launched five seconds apart. Slow/offline
+    // nodes may still overlap, but source sites never receive a 24-node burst.
+    // Master first, then keep the configured order for all workers.
+    const ordered=nodes.map((n,i)=>({n,i})).sort((a,b)=>(isMaster(a.n)?0:1)-(isMaster(b.n)?0:1)).map(x=>x.i);
+    const pending=[];
+    for(let pos=0;pos<ordered.length;pos++){
+      if(pos)await sleep(5000);
+      const i=ordered[pos];
+      pending.push((async()=>{
+        try{const d=await nodeCall(i,'start');if(!d.ok)failed++}
+        catch{failed++}
+        finally{done++;setNotice(`Start: ${done}/${nodes.length}${failed?` · ${failed} fehlgeschlagen`:''}`,failed?'warn':'')}
+      })());
+    }
+    await Promise.all(pending);
+  }else{
+    await poolIndices(nodes.map((_,i)=>i),4,async i=>{
+      try{const d=await nodeCall(i,action);if(!d.ok)failed++}
+      catch{failed++}
+      finally{done++;setNotice(`Fortschritt: ${done}/${nodes.length}${failed?` · ${failed} fehlgeschlagen`:''}`,failed?'warn':'')}
+    });
+  }
   applyJobs();
   if(action==='start'||action==='kill'){await sleep(1500);silentCheckAll(false)}
 }
@@ -516,8 +551,13 @@ async function saveEdit(){
       $('edit-dialog').close();await loadNodes();setNotice(`${node.name}: Konfiguration gespeichert, aber der Stream konnte nicht neu gestartet werden: ${d.apply.output||d.apply.failure||'unbekannter Fehler'}`,'bad');setTimeout(()=>silentCheck(d.index,false),800);return;
     }
     $('edit-dialog').close();await loadNodes();
-    const warn=d.apply?.old_stop_warning;setNotice(warn?`${node.name}: Gespeichert und gestartet; beim Stoppen des alten Ziels gab es eine Warnung: ${warn}`:`${node.name}: gespeichert${apply?' und Stream neu gestartet':''}`,warn?'warn':'good');
-    setTimeout(()=>silentCheck(d.index,false),1500);setTimeout(()=>silentCheck(d.index,false),5000)
+    if(apply&&node.url){
+      applyHealth(d.index,{STATUS:'running',STREAM_HEALTH:'starting',STREAM_REASON:'configuration saved; restarting stream',STREAM_SOURCE:sourceLabel(node.url),SELECTED_STREAM:'unknown',STREAM_RETRY_IN:'0'});
+    }else if(apply&&!node.url){
+      applyHealth(d.index,{STATUS:'stopped',STREAM_HEALTH:'stopped',STREAM_REASON:'stream is not running',STREAM_SOURCE:'unknown',SELECTED_STREAM:'unknown',STREAM_RETRY_IN:'0'});
+    }
+    const warn=d.apply?.old_stop_warning;setNotice(warn?`${node.name}: Gespeichert und gestartet; beim Stoppen des alten Ziels gab es eine Warnung: ${warn}`:`${node.name}: gespeichert${apply?' · Stream mit neuer Konfiguration neu gestartet':''}`,warn?'warn':'good');
+    setTimeout(()=>silentCheck(d.index,false),1000);setTimeout(()=>silentCheck(d.index,false),4000);setTimeout(()=>silentCheck(d.index,false),12000)
   }catch(e){$('edit-error').textContent=e.message;$('edit-error').hidden=false}
   finally{$('save-button').disabled=false}
 }

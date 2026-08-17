@@ -72,7 +72,7 @@ systemctl list-timers stream-master-git-update.timer
 6. Schlägt diese Prüfung fehl, wird der vorherige Commit automatisch wiederhergestellt.
 7. Nur bei einem erfolgreichen Code-Update wird `stream-master.service` neu gestartet.
 
-Wichtig: Ein Git-bedingter Service-Neustart startet **nicht** alle 24 Streams neu. Der automatische `Start all` wird über die Linux-Boot-ID nur **einmal pro tatsächlichem Master-Boot** ausgeführt.
+Wichtig: Ein erfolgreicher Git-bedingter Service-Neustart führt anschließend absichtlich wieder einen `Start / Restart all` für alle konfigurierten Streams aus. Dadurch läuft nach einem Code-Deploy überall garantiert der neue Start-/Supervisor-Code.
 
 ## Boot ohne Internet/GitHub
 

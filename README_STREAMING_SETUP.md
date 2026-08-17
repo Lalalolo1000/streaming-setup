@@ -27,3 +27,8 @@ Browser-Titel und Favicon zeigen die Zahl der aktuell per SSH erreichbaren Pis m
 ## SSH
 
 Der Controller verwendet nur Passwort-Authentifizierung und ignoriert SSH-Host-Keys. Damit gibt es nach Klonen/Reimaging keine Host-Key-Konflikte innerhalb des Controllers.
+
+
+## YouTube LOGIN_REQUIRED / Cookies
+
+Optional kann auf dem Master im Projektordner `youtube-cookies.txt` (Netscape-Format) liegen. Die Datei ist Git-ignoriert und wird bei jedem YouTube-Start temporär nach `/tmp/stream-master/youtube-cookies.txt` auf den Ziel-Pi übertragen. `LOGIN_REQUIRED` bekommt eine 10-Minuten-Pause statt schneller Endlosschleifen. Stop/Restart beendet die komplette Prozessgruppe aus Supervisor, Streamlink, VLC und Hilfsprozessen.

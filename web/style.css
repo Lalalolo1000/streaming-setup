@@ -48,6 +48,12 @@ body:not(.admin-view) .node.state-live{border-left-color:var(--good)}body:not(.a
 .node-main{padding:15px 16px}.node-header{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:13px}.node-name{font-size:16px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}.node-target-simple{color:var(--muted);font-size:11px;margin-top:3px}
 .status{display:flex;align-items:center;justify-content:flex-end;gap:7px;text-align:right;min-width:0}.dot{width:9px;height:9px;flex:0 0 9px;border-radius:50%;background:var(--neutral)}.dot.live{background:var(--good)}.dot.warning{background:var(--warn)}.dot.failed{background:var(--bad)}.dot.stopped,.dot.unknown{background:var(--neutral)}.status-label{font-size:12px;font-weight:700;line-height:1.25}.status-detail{font-size:11px;color:var(--muted);margin-top:2px;line-height:1.35;max-width:420px}
 body:not(.admin-view) .status-detail{display:none}
+/* In the compact overview, expose retry/wait information without showing the
+   full technical detail for healthy streams. */
+body:not(.admin-view) .node[data-health="retrying"] .status-detail,
+body:not(.admin-view) .node[data-health="cooldown"] .status-detail,
+body:not(.admin-view) .node[data-health="waiting"] .status-detail,
+body:not(.admin-view) .node[data-health="youtube_login_required"] .status-detail{display:block;max-width:220px;margin-top:3px}
 .url-block{min-width:0}.url-label{font-size:10px;letter-spacing:.055em;text-transform:uppercase;font-weight:700;color:#79838d;margin-bottom:5px}.node-url{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#3c454e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.node-url.empty-url{color:#8a939c;font-style:italic}.source{display:block;color:var(--muted);font-size:11px;margin-top:4px}
 body:not(.admin-view) .url-label,body:not(.admin-view) .source{display:none}
 body:not(.admin-view) .url-block{min-height:24px;margin-bottom:14px}

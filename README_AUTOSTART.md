@@ -43,7 +43,7 @@ Wenn Master und Pis morgens gemeinsam Strom bekommen:
 7. Noch nicht erreichbare Pis werden bis zu 15 Minuten erneut versucht.
 8. Sobald `start.sh` auf einem Pi erfolgreich gestartet wurde, übernimmt dort der `/tmp`-Supervisor Streamlink/VLC-Retries.
 
-Der einmalige Tagesstart ist an die aktuelle Linux-**Boot-ID** gebunden. Ein späterer Neustart nur des Python-Dienstes – zum Beispiel nach einem GitHub-Codeupdate – startet deshalb nicht alle Videos unnötig neu.
+Der Start/Restart-Pass läuft bei **jedem Start des Python-Masterdienstes**. Das ist absichtlich so: täglicher Power-on, manueller Service-Neustart und ein erfolgreicher GitHub-Codeupdate wenden die aktuelle Konfiguration jeweils erneut auf alle Streams an. Die Startaufrufe erfolgen dabei nicht gleichzeitig: der Master kommt zuerst, anschließend werden die konfigurierten Nodes standardmäßig im Abstand von 5 Sekunden gestartet. Offline Nodes werden erst nach dem ersten Durchlauf erneut versucht.
 
 ## Wenn ein Streamprozess abstürzt
 
